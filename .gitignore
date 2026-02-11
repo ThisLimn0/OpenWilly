@@ -1,0 +1,49 @@
+# .gitignore for OpenWilly
+
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock  # Uncomment if this is a library
+
+# Build artifacts
+*.dll
+*.exe
+*.so
+*.dylib
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Game files (don't commit ISOs!)
+*.iso
+*.bin
+*.cue
+*.mdf
+*.mds
+*.nrg
+
+# Extracted game directories
+/extracted/
+/games/
+/temp/
+
+# Logs
+*.log
+logs/
+
+# Configuration (may contain paths)
+config.toml
+settings.toml
+
+# Test artifacts
+/test_output/

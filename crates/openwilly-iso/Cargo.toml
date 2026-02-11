@@ -1,0 +1,19 @@
+[package]
+name = "openwilly-iso"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+openwilly-common = { workspace = true }
+
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# ISO parsing
+# Note: We'll implement our own ISO9660 parser initially
+# iso9660 = "0.3"  # Alternative if we want to use existing crate
+
+[dev-dependencies]

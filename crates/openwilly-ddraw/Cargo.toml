@@ -1,0 +1,26 @@
+[package]
+name = "openwilly-ddraw"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]  # Important: This creates a DLL
+
+[dependencies]
+openwilly-common = { workspace = true }
+
+windows.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+
+# For modern graphics rendering (optional - not needed for Director-based games)
+# wgpu = "0.19"
+
+# COM interface helpers (requires nightly - disabled for stable builds)
+# com = "0.6"
+
+[dev-dependencies]

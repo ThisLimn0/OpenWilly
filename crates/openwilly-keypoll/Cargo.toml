@@ -1,0 +1,23 @@
+[package]
+name = "openwilly-keypoll"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Replacement KEYPOLL.X32 Xtra for Director 6.0 with keyboard filtering"
+
+[lib]
+crate-type = ["cdylib"]  # Creates a DLL
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_Debug",
+]}
+
+# Build configuration for 32-bit target
+# Build with: cargo build --release --target i686-pc-windows-msvc

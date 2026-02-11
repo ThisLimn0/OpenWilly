@@ -1,0 +1,22 @@
+[package]
+name = "openwilly-director"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+openwilly-common = { workspace = true }
+
+windows = { workspace = true }
+anyhow.workspace = true
+tracing.workspace = true
+
+# COM support
+windows-implement = "0.58"
+
+[build-dependencies]
+windows = { workspace = true }
