@@ -349,6 +349,11 @@ impl SaveManager {
         self.save();
     }
 
+    /// Check if the player has a specific stuff flag
+    pub fn has_stuff(&self, item: &str) -> bool {
+        self.active().map_or(false, |u| u.own_stuff.iter().any(|s| s == item))
+    }
+
     /// Remove an owned item
     #[allow(dead_code)] // Will be used when scene_script gets RemoveStuff
     pub fn remove_stuff(&mut self, item: &str) {
@@ -376,6 +381,11 @@ impl SaveManager {
             tracing::info!("Added part {} to yard inventory", part_id);
         }
         self.save();
+    }
+
+    /// Check if a part is already in the yard inventory
+    pub fn has_yard_part(&self, part_id: u32) -> bool {
+        self.active().map_or(false, |u| u.junk.yard.contains_key(&part_id))
     }
 }
 

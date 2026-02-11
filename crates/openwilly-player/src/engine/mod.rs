@@ -23,7 +23,7 @@ enum EngineState {
     EscapeMenu { selected: usize },
 }
 
-const ESCAPE_MENU_ITEMS: [&str; 3] = ["Weiterspielen", "Vollbild umschalten", "Beenden"];
+const ESCAPE_MENU_COUNT: usize = 4; // resume, fullscreen, detail noise, quit
 
 /// Sprite rendered by the engine
 #[derive(Clone, Debug)]
@@ -75,23 +75,59 @@ impl Sprite {
     }
 }
 
-/// Scale the 640×480 framebuffer to any target size using per-axis nearest-
+/// Scale the 640x480 framebuffer to any target size using per-axis nearest-
 /// neighbor sampling. Horizontal and vertical scale factors are independent,
-/// enabling PAR adjustment (e.g. 640×480 → 1920×1080: 3.0× H, 2.25× V).
-fn scale_to_size(src: &[u32], dst: &mut [u32], dst_w: usize, dst_h: usize) {
+/// enabling PAR adjustment (e.g. 640x480 -> 1920x1080: 3.0x H, 2.25x V).
+///
+/// When `detail_noise` is true, pixels that were NOT directly sampled from
+/// the source (i.e. duplicated neighbors) receive a subtle random brightness
+/// perturbation of +/-0.2 (mapped to +/-51 on the 0-255 channel range).
+/// This increases perceived sharpness and adds natural-looking micro-detail
+/// at higher resolutions without affecting the original source pixels.
+fn scale_to_size(src: &[u32], dst: &mut [u32], dst_w: usize, dst_h: usize, detail_noise: bool, frame: u64) {
+    // Simple LCG-based fast noise — NOT crypto-quality, just visual dither
+    let mut rng_state: u32 = (frame as u32).wrapping_mul(2654435761);
+
     for dy in 0..dst_h {
         let sy = (dy * SCREEN_HEIGHT) / dst_h;
         let dst_row = dy * dst_w;
         let src_row = sy * SCREEN_WIDTH;
+
+        // Track which source column the previous dst pixel came from,
+        // so we can detect "duplicate" (non-original) samples.
+        let mut prev_sx: usize = usize::MAX;
+
         for dx in 0..dst_w {
             let sx = (dx * SCREEN_WIDTH) / dst_w;
-            dst[dst_row + dx] = src[src_row + sx];
+            let pixel = src[src_row + sx];
+
+            if !detail_noise || sx != prev_sx {
+                // Original sample — output unchanged
+                dst[dst_row + dx] = pixel;
+            } else {
+                // Duplicated neighbor — apply brightness noise +/-0.2
+                // Advance the LCG
+                rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
+                // Map to range [-51, +51]  (0.2 * 255 ~ 51)
+                let noise = ((rng_state >> 16) % 103) as i32 - 51;
+
+                let r = ((pixel >> 16) & 0xFF) as i32;
+                let g = ((pixel >> 8) & 0xFF) as i32;
+                let b = (pixel & 0xFF) as i32;
+
+                let r2 = (r + noise).clamp(0, 255) as u32;
+                let g2 = (g + noise).clamp(0, 255) as u32;
+                let b2 = (b + noise).clamp(0, 255) as u32;
+
+                dst[dst_row + dx] = 0xFF000000 | (r2 << 16) | (g2 << 8) | b2;
+            }
+            prev_sx = sx;
         }
     }
 }
 
-/// Draw semi-transparent escape/pause menu overlay onto the 640×480 framebuffer
-fn draw_escape_menu(fb: &mut [u32], selected: usize) {
+/// Draw semi-transparent escape/pause menu overlay onto the 640x480 framebuffer
+fn draw_escape_menu(fb: &mut [u32], selected: usize, detail_noise: bool, lang: crate::game::i18n::Language) {
     // Darken the entire framebuffer
     for pixel in fb.iter_mut() {
         let r = (*pixel >> 16) & 0xFF;
@@ -101,7 +137,7 @@ fn draw_escape_menu(fb: &mut [u32], selected: usize) {
     }
 
     let box_w: i32 = 280;
-    let box_h: i32 = 150;
+    let box_h: i32 = 180;
     let box_x = (SCREEN_WIDTH as i32 - box_w) / 2;
     let box_y = (SCREEN_HEIGHT as i32 - box_h) / 2;
 
@@ -109,24 +145,33 @@ fn draw_escape_menu(fb: &mut [u32], selected: usize) {
     font::draw_rect_outline(fb, box_x, box_y, box_w, box_h, 0xFF6666CC);
     font::draw_rect_outline(fb, box_x + 2, box_y + 2, box_w - 4, box_h - 4, 0xFF444488);
 
-    let title = "= PAUSE =";
+    use crate::game::i18n::t;
+    let title = t(lang, "pause_title");
     font::draw_text_shadow(fb,
         box_x + (box_w - font::text_width(title)) / 2,
         box_y + 14, title, 0xFFFFFF00);
 
-    for (i, item) in ESCAPE_MENU_ITEMS.iter().enumerate() {
+    let item_keys = ["menu_resume", "menu_fullscreen", "menu_detail_noise", "menu_quit"];
+    for (i, key) in item_keys.iter().enumerate() {
+        let label = t(lang, key);
         let iy = box_y + 46 + i as i32 * 26;
         let color = if i == selected { 0xFFFFFF00 } else { 0xFFBBBBBB };
         if i == selected {
             font::draw_rect(fb, box_x + 6, iy - 2, box_w - 12, 20, 0xFF333366);
         }
         let prefix = if i == selected { "> " } else { "  " };
-        let text = format!("{}{}", prefix, item);
+        // Show toggle state for Detail-Rauschen (index 2)
+        let suffix = if i == 2 {
+            if detail_noise { " [ON]" } else { " [OFF]" }
+        } else {
+            ""
+        };
+        let text = format!("{}{}{}", prefix, label, suffix);
         font::draw_text_shadow(fb, box_x + 20, iy + 2, &text, color);
     }
 
     font::draw_text(fb, box_x + 14, box_y + box_h - 22,
-        "Pfeiltasten + Enter | Esc", 0xFF777799);
+        t(lang, "pause_hint"), 0xFF777799);
 }
 
 /// Run the game engine
@@ -158,6 +203,7 @@ pub fn run(assets: AssetStore) -> Result<()> {
         let mut window = Window::new("OpenWilly – Willy Werkel", win_w, win_h, options)
             .map_err(|e| anyhow::anyhow!("Window creation failed: {}", e))?;
         window.set_target_fps(FPS as usize);
+        window.set_cursor_visibility(false); // Software cursor rendered on framebuffer
 
         // Set window icon from game data (WILLY32.EXE icon or MULLE.ICO)
         icon::set_window_icon(&mut window, &game.assets.game_dir);
@@ -251,19 +297,19 @@ pub fn run(assets: AssetStore) -> Result<()> {
                             sel -= 1;
                         }
                         if window.is_key_pressed(Key::Down, minifb::KeyRepeat::Yes)
-                            && sel < ESCAPE_MENU_ITEMS.len() - 1
+                            && sel < ESCAPE_MENU_COUNT - 1
                         {
                             sel += 1;
                         }
 
                         // Mouse hover over menu items
                         let box_x = (SCREEN_WIDTH as i32 - 280) / 2;
-                        let box_y = (SCREEN_HEIGHT as i32 - 150) / 2;
+                        let box_y = (SCREEN_HEIGHT as i32 - 180) / 2;
                         if mx >= box_x + 6 && mx < box_x + 274 {
                             let rel_y = my - (box_y + 44);
                             if rel_y >= 0 {
                                 let idx = (rel_y / 26) as usize;
-                                if idx < ESCAPE_MENU_ITEMS.len() {
+                                if idx < ESCAPE_MENU_COUNT {
                                     sel = idx;
                                 }
                             }
@@ -280,7 +326,7 @@ pub fn run(assets: AssetStore) -> Result<()> {
                             let rel_y = my - (box_y + 44);
                             if rel_y >= 0 {
                                 let idx = (rel_y / 26) as usize;
-                                if idx < ESCAPE_MENU_ITEMS.len() {
+                                if idx < ESCAPE_MENU_COUNT {
                                     action = Some(idx);
                                 }
                             }
@@ -291,6 +337,11 @@ pub fn run(assets: AssetStore) -> Result<()> {
                                 0 => engine_state = EngineState::Playing,
                                 1 => toggle_fs = true,
                                 2 => {
+                                    // Toggle detail noise
+                                    game.dev_menu.detail_noise = !game.dev_menu.detail_noise;
+                                    tracing::info!("Detail noise → {}", game.dev_menu.detail_noise);
+                                }
+                                3 => {
                                     tracing::info!("Engine shutdown (menu)");
                                     return Ok(());
                                 }
@@ -322,8 +373,11 @@ pub fn run(assets: AssetStore) -> Result<()> {
 
             // Draw escape menu overlay if paused
             if let EngineState::EscapeMenu { selected } = engine_state {
-                draw_escape_menu(&mut framebuffer, selected);
+                draw_escape_menu(&mut framebuffer, selected, game.dev_menu.detail_noise, game.language);
             }
+
+            // Software cursor (drawn last, always on top)
+            game.cursor.blit(&mut framebuffer, SCREEN_WIDTH, SCREEN_HEIGHT, mx, my);
 
             // Update window title
             frame_count += 1;
@@ -343,7 +397,8 @@ pub fn run(assets: AssetStore) -> Result<()> {
             }
 
             // Scale to output size and present
-            scale_to_size(&framebuffer, &mut scaled_buf, out_w, out_h);
+            scale_to_size(&framebuffer, &mut scaled_buf, out_w, out_h,
+                          game.dev_menu.detail_noise, frame_count);
             window
                 .update_with_buffer(&scaled_buf, out_w, out_h)
                 .map_err(|e| anyhow::anyhow!("Display error: {}", e))?;

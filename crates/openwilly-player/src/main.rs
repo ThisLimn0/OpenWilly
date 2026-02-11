@@ -224,79 +224,353 @@ fn extract_iso_contents(iso_path: &Path, target: &Path) -> Result<()> {
     let file = std::fs::File::open(iso_path)
         .with_context(|| format!("Failed to open ISO: {}", iso_path.display()))?;
 
-    let iso = ISO9660::new(file)
-        .with_context(|| format!("Failed to parse ISO9660: {}", iso_path.display()))?;
+    match ISO9660::new(file) {
+        Ok(iso) => {
+            fn extract_dir<T: Read + Seek>(
+                dir: &iso9660::ISODirectory<T>,
+                target: &Path,
+                prefix: &str,
+            ) -> Result<()> {
+                for entry in dir.contents() {
+                    let entry = entry?;
+                    let name = entry.identifier().to_string();
 
-    fn extract_dir<T: Read + Seek>(
-        dir: &iso9660::ISODirectory<T>,
-        target: &Path,
-        prefix: &str,
-    ) -> Result<()> {
-        for entry in dir.contents() {
-            let entry = entry?;
-            let name = entry.identifier().to_string();
-
-            // Skip . and ..
-            if name == "\0" || name == "\x01" || name.is_empty() {
-                continue;
-            }
-
-            // Clean version suffix (";1")
-            let clean = if let Some(idx) = name.find(';') {
-                &name[..idx]
-            } else {
-                &name
-            };
-
-            let rel_path = if prefix.is_empty() {
-                clean.to_string()
-            } else {
-                format!("{}/{}", prefix, clean)
-            };
-
-            match entry {
-                DirectoryEntry::Directory(subdir) => {
-                    let dst = target.join(&rel_path);
-                    std::fs::create_dir_all(&dst)?;
-                    extract_dir(&subdir, target, &rel_path)?;
-                }
-                DirectoryEntry::File(iso_file) => {
-                    let dst = target.join(&rel_path);
-                    if let Some(parent) = dst.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-
-                    // Skip installer/autorun files
-                    let upper = clean.to_uppercase();
-                    if upper == "AUTORUN.INF"
-                        || upper == "SETUP.EXE"
-                        || upper == "INSTALL.EXE"
-                        || upper.ends_with(".INI")
-                            && (upper.contains("SETUP") || upper.contains("INSTALL"))
-                    {
+                    // Skip . and ..
+                    if name == "\0" || name == "\x01" || name.is_empty() {
                         continue;
                     }
 
-                    let mut reader = iso_file.read();
-                    let mut out = std::fs::File::create(&dst)
-                        .with_context(|| format!("Failed to create: {}", dst.display()))?;
-                    std::io::copy(&mut reader, &mut out)?;
+                    // Clean version suffix (";1")
+                    let clean = if let Some(idx) = name.find(';') {
+                        &name[..idx]
+                    } else {
+                        &name
+                    };
 
-                    let size = iso_file.size();
-                    if size > 1_000_000 {
+                    let rel_path = if prefix.is_empty() {
+                        clean.to_string()
+                    } else {
+                        format!("{}/{}", prefix, clean)
+                    };
+
+                    match entry {
+                        DirectoryEntry::Directory(subdir) => {
+                            let dst = target.join(&rel_path);
+                            std::fs::create_dir_all(&dst)?;
+                            extract_dir(&subdir, target, &rel_path)?;
+                        }
+                        DirectoryEntry::File(iso_file) => {
+                            let dst = target.join(&rel_path);
+                            if let Some(parent) = dst.parent() {
+                                std::fs::create_dir_all(parent)?;
+                            }
+
+                            // Skip installer/autorun files
+                            let upper = clean.to_uppercase();
+                            if upper == "AUTORUN.INF"
+                                || upper == "SETUP.EXE"
+                                || upper == "INSTALL.EXE"
+                                || upper.ends_with(".INI")
+                                    && (upper.contains("SETUP") || upper.contains("INSTALL"))
+                            {
+                                continue;
+                            }
+
+                            let mut reader = iso_file.read();
+                            let mut out = std::fs::File::create(&dst)
+                                .with_context(|| format!("Failed to create: {}", dst.display()))?;
+                            std::io::copy(&mut reader, &mut out)?;
+
+                            let size = iso_file.size();
+                            if size > 1_000_000 {
+                                println!(
+                                    "  {} ({:.1} MB)",
+                                    rel_path,
+                                    size as f64 / 1_000_000.0
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            extract_dir(&iso.root, target, "")
+        }
+        Err(e) => {
+            // iso9660 crate fails on some ISOs (e.g. null-filled timestamps).
+            // Fall back to our own robust raw parser.
+            tracing::warn!("iso9660 crate failed ({}), using fallback parser", e);
+            println!("  Note: using fallback ISO parser...");
+            extract_iso_raw(iso_path, target)
+        }
+    }
+}
+
+// ─── Fallback raw ISO9660 parser ────────────────────────────────────────────
+
+/// Robust fallback ISO extractor that reads ISO9660 structures manually.
+/// Handles ISOs where the `iso9660` crate fails (null timestamps, non-UTF8, etc.)
+fn extract_iso_raw(iso_path: &Path, target: &Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const SECTOR_SIZE: u64 = 2048;
+
+    let mut file = std::fs::File::open(iso_path)?;
+
+    // Read Primary Volume Descriptor (sector 16)
+    file.seek(SeekFrom::Start(16 * SECTOR_SIZE))?;
+    let mut pvd = [0u8; 2048];
+    file.read_exact(&mut pvd)?;
+
+    // Verify PVD signature: byte 0 = type 1, bytes 1..6 = "CD001"
+    if &pvd[1..6] != b"CD001" {
+        anyhow::bail!("Not a valid ISO 9660 image (missing CD001 signature)");
+    }
+
+    // Root directory record is at PVD offset 156, 34 bytes long
+    // LBA of root directory extent (little-endian u32 at offset 158 in PVD)
+    let root_lba = u32::from_le_bytes([pvd[158], pvd[159], pvd[160], pvd[161]]) as u64;
+    // Data length of root directory (little-endian u32 at offset 166 in PVD)
+    let root_size = u32::from_le_bytes([pvd[166], pvd[167], pvd[168], pvd[169]]) as u64;
+
+    tracing::info!("ISO PVD: root directory at LBA {}, size {} bytes", root_lba, root_size);
+
+    extract_iso_directory_raw(&mut file, root_lba, root_size, target, "")
+}
+
+/// Recursively extract files from an ISO directory using raw sector reading
+fn extract_iso_directory_raw(
+    file: &mut std::fs::File,
+    dir_lba: u64,
+    dir_size: u64,
+    target: &Path,
+    current_path: &str,
+) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    const SECTOR_SIZE: u64 = 2048;
+
+    let file_len = file.metadata()?.len();
+    let max_lba = file_len / SECTOR_SIZE;
+
+    if dir_lba >= max_lba {
+        anyhow::bail!("Directory LBA {} beyond ISO end (max {})", dir_lba, max_lba);
+    }
+
+    // Read directory data (may span multiple sectors)
+    let sectors_needed = (dir_size + SECTOR_SIZE - 1) / SECTOR_SIZE;
+    let sectors_to_read = std::cmp::min(sectors_needed, max_lba.saturating_sub(dir_lba));
+
+    let mut dir_data = vec![0u8; (sectors_to_read * SECTOR_SIZE) as usize];
+    file.seek(SeekFrom::Start(dir_lba * SECTOR_SIZE))?;
+    let bytes_read = file.read(&mut dir_data)?;
+    dir_data.truncate(bytes_read);
+
+    if dir_data.is_empty() {
+        return Ok(());
+    }
+
+    let mut offset = 0usize;
+
+    while offset < dir_size as usize && offset < dir_data.len() {
+        let record_len = dir_data[offset] as usize;
+        if record_len == 0 {
+            // Padding at sector boundary — advance to next sector
+            let next_sector = ((offset / SECTOR_SIZE as usize) + 1) * SECTOR_SIZE as usize;
+            if next_sector >= dir_data.len() {
+                break;
+            }
+            offset = next_sector;
+            continue;
+        }
+
+        if offset + record_len > dir_data.len() {
+            break;
+        }
+
+        let record = &dir_data[offset..offset + record_len];
+
+        // ISO 9660 directory entry layout:
+        //   [2..6]   extent LBA (LE u32)
+        //   [10..14] data length (LE u32)
+        //   [25]     file flags
+        //   [26]     file unit size (interleave)
+        //   [28]     interleave gap size
+        //   [32]     name length
+        //   [33..]   name
+        let extent_lba = u32::from_le_bytes([record[2], record[3], record[4], record[5]]) as u64;
+        let data_length = u32::from_le_bytes([record[10], record[11], record[12], record[13]]) as u64;
+        let file_flags = record[25];
+        let file_unit_size = record[26];
+        let interleave_gap = record[28];
+        let name_len = record[32] as usize;
+
+        if name_len == 0 || offset + 33 + name_len > dir_data.len() {
+            offset += record_len;
+            continue;
+        }
+
+        let name_bytes = &record[33..33 + name_len];
+
+        // Skip . and .. entries (encoded as 0x00 and 0x01)
+        if name_bytes == [0x00] || name_bytes == [0x01] {
+            offset += record_len;
+            continue;
+        }
+
+        // Decode name (lossy for non-UTF8 compatibility)
+        let name = String::from_utf8_lossy(name_bytes).to_string();
+
+        // Remove version suffix (";1")
+        let clean_name = if let Some(idx) = name.find(';') {
+            &name[..idx]
+        } else {
+            &name
+        };
+
+        let entry_path = if current_path.is_empty() {
+            clean_name.to_string()
+        } else {
+            format!("{}/{}", current_path, clean_name)
+        };
+
+        let is_directory = (file_flags & 0x02) != 0;
+        let is_interleaved = file_unit_size > 0 && interleave_gap > 0;
+
+        if is_directory {
+            let dst_dir = target.join(&entry_path);
+            std::fs::create_dir_all(&dst_dir)?;
+            extract_iso_directory_raw(file, extent_lba, data_length, target, &entry_path)?;
+        } else {
+            // Skip installer/autorun files
+            let upper = clean_name.to_uppercase();
+            if upper == "AUTORUN.INF"
+                || upper == "SETUP.EXE"
+                || upper == "INSTALL.EXE"
+                || upper.starts_with("_INST")
+                || upper.starts_with("_SETUP")
+                || upper.starts_with("_ISDEL")
+                || upper.starts_with("_ISRES")
+                || (upper.ends_with(".INI") && (upper.contains("SETUP") || upper.contains("INSTALL")))
+            {
+                offset += record_len;
+                continue;
+            }
+
+            let dst_path = target.join(&entry_path);
+            if let Some(parent) = dst_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            if !dst_path.exists() {
+                if is_interleaved {
+                    tracing::debug!(
+                        "Extracting interleaved file: {} (unit={}, gap={})",
+                        entry_path, file_unit_size, interleave_gap
+                    );
+                    extract_interleaved_file(
+                        file, extent_lba, data_length,
+                        file_unit_size, interleave_gap, &dst_path,
+                    )?;
+                } else {
+                    // Normal file — sequential read
+                    if extent_lba >= max_lba {
+                        tracing::warn!("Skipping {} — LBA {} beyond ISO end", entry_path, extent_lba);
+                        offset += record_len;
+                        continue;
+                    }
+
+                    file.seek(SeekFrom::Start(extent_lba * SECTOR_SIZE))?;
+
+                    let available = file_len.saturating_sub(extent_lba * SECTOR_SIZE);
+                    let to_read = std::cmp::min(data_length, available) as usize;
+
+                    let mut data = vec![0u8; to_read];
+                    let n = file.read(&mut data)?;
+                    data.truncate(n);
+
+                    let mut out = std::fs::File::create(&dst_path)?;
+                    out.write_all(&data)?;
+
+                    if data_length > 1_000_000 {
                         println!(
                             "  {} ({:.1} MB)",
-                            rel_path,
-                            size as f64 / 1_000_000.0
+                            entry_path,
+                            data_length as f64 / 1_000_000.0
                         );
                     }
                 }
             }
         }
-        Ok(())
+
+        offset += record_len;
     }
 
-    extract_dir(&iso.root, target, "")
+    Ok(())
+}
+
+/// Extract an interleaved file by reading data units and skipping gap sectors
+fn extract_interleaved_file(
+    file: &mut std::fs::File,
+    start_lba: u64,
+    data_length: u64,
+    file_unit_size: u8,
+    interleave_gap: u8,
+    dst_path: &Path,
+) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    const SECTOR_SIZE: u64 = 2048;
+
+    let file_len = file.metadata()?.len();
+    let max_lba = file_len / SECTOR_SIZE;
+
+    if start_lba >= max_lba {
+        anyhow::bail!("Interleaved file start LBA {} beyond ISO end", start_lba);
+    }
+
+    let unit_sectors = file_unit_size as u64;
+    let gap_sectors = interleave_gap as u64;
+    let bytes_per_unit = unit_sectors * SECTOR_SIZE;
+
+    let mut output = std::fs::File::create(dst_path)?;
+    let mut bytes_written = 0u64;
+    let mut current_lba = start_lba;
+
+    while bytes_written < data_length {
+        if current_lba >= max_lba {
+            tracing::warn!(
+                "Interleaved extraction partial: {} of {} bytes at LBA {}",
+                bytes_written, data_length, current_lba
+            );
+            break;
+        }
+
+        file.seek(SeekFrom::Start(current_lba * SECTOR_SIZE))?;
+
+        let bytes_to_read = std::cmp::min(bytes_per_unit, data_length - bytes_written);
+        let available = file_len.saturating_sub(current_lba * SECTOR_SIZE);
+        let actual = std::cmp::min(bytes_to_read, available) as usize;
+
+        if actual == 0 {
+            break;
+        }
+
+        let mut buffer = vec![0u8; actual];
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        buffer.truncate(n);
+        output.write_all(&buffer)?;
+        bytes_written += n as u64;
+
+        // Skip to next unit (data unit + gap)
+        current_lba += unit_sectors + gap_sectors;
+    }
+
+    Ok(())
 }
 
 /// Count Director game files in a directory (recursive)

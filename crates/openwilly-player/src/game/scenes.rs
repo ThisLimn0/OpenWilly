@@ -360,10 +360,10 @@ pub struct Hotspot {
 /// Scene handler — manages sprites, buttons, actors, and interaction
 pub struct SceneHandler {
     scene: Scene,
-    sprites: Vec<Sprite>,
-    buttons: Vec<MulleButton>,
+    pub sprites: Vec<Sprite>,
+    pub buttons: Vec<MulleButton>,
     actors: Vec<Actor>,
-    hotspots: Vec<Hotspot>,
+    pub hotspots: Vec<Hotspot>,
     // Menu UI state
     input_text: String,
     cursor_visible: bool,
@@ -378,10 +378,17 @@ pub struct SceneHandler {
     talking_actor: Option<String>,
     /// Whether a road-legal car exists (affects Yard layout)
     has_car: bool,
+    /// Pre-computed carshow rating (1–5), set when entering CarShow
+    carshow_rating: u8,
 }
 
 impl SceneHandler {
     pub fn new(scene: Scene, assets: &AssetStore, has_car: bool) -> Self {
+        Self::new_with_rating(scene, assets, has_car, 1)
+    }
+
+    /// Create a scene handler with a pre-computed carshow rating
+    pub fn new_with_rating(scene: Scene, assets: &AssetStore, has_car: bool, carshow_rating: u8) -> Self {
         let mut handler = Self {
             scene,
             sprites: Vec::new(),
@@ -397,6 +404,7 @@ impl SceneHandler {
             drag_drop: DragDropState::new(),
             talking_actor: None,
             has_car,
+            carshow_rating,
         };
 
         handler.load_scene(assets);
@@ -503,7 +511,7 @@ impl SceneHandler {
             (f, 115), (f, 116), (f, 117), (f, 118),
             (f, 119), (f, 120), (f, 121), (f, 122),
         ], 10, true, assets);
-        mouth.play("talkPlayer");
+        mouth.play("idle");
         self.actors.push(mouth);
     }
 
@@ -550,6 +558,24 @@ impl SceneHandler {
         mulle.add_animation("lookLeft", &[(b, 283)], 10, true, assets);
         mulle.play("lookPlayer");
         self.actors.push(mulle);
+
+        // Figge actor at the side door (hidden until triggered)
+        // Sprites from 03.DXR members 81-93
+        let mut figge = Actor::new("figge", 0, 0, 18);
+        figge.add_animation("enter", &[
+            (f, 81), (f, 82), (f, 83), (f, 84), (f, 85),
+        ], 10, false, assets);
+        figge.add_animation("entered", &[(f, 86)], 10, true, assets);
+        figge.add_animation("exit", &[
+            (f, 85), (f, 84), (f, 83), (f, 82), (f, 81),
+        ], 10, false, assets);
+        figge.add_animation("talk", &[
+            (f, 86), (f, 87), (f, 88), (f, 89),
+            (f, 90), (f, 91), (f, 92), (f, 93),
+        ], 10, true, assets);
+        figge.set_talk_anims("talk", "entered");
+        figge.visible = false;
+        self.actors.push(figge);
     }
 
     // ─── Junkyard (02.DXR / 02.CXT) ────────────────────────────────────
@@ -560,6 +586,9 @@ impl SceneHandler {
 
     fn load_junkyard_pile(&mut self, pile: u8, assets: &AssetStore) {
         let f = self.resolve_file("02", assets);
+
+        // Set pile drop rects (3 stacked rects per pile from mulle.js)
+        self.drag_drop.drop_rects = crate::game::drag_drop::DropRect::pile_rects(pile);
 
         // Pile member data from mulle.js:
         //   (door default, door hover, right arrow default, right arrow hover,
@@ -627,29 +656,42 @@ impl SceneHandler {
             self.buttons.push(btn);
         }
 
-        // Side door → Garage: #13 default, #14 hover
-        if let Some(btn) = MulleButton::new(
-            "Seitentür → Werkstatt", &f, 13, Some(14),
-            Some(Scene::Garage), 5, assets
-        ) {
-            self.buttons.push(btn);
-        }
+        if self.has_car {
+            // ── Car mode: side door is static overlay, garage door clickable
+            //    Road overlay + hotspot to World ──
+            self.load_overlay(&f, 13, 4, true, assets);  // side door static
 
-        // Garage door → Garage: #40 default, #41 hover
-        if let Some(btn) = MulleButton::new(
-            "Garagentor → Werkstatt", &f, 40, Some(41),
-            Some(Scene::Garage), 6, assets
-        ) {
-            self.buttons.push(btn);
-        }
+            // Garage door → Garage
+            if let Some(btn) = MulleButton::new(
+                "Garagentor → Werkstatt", &f, 40, Some(41),
+                Some(Scene::Garage), 6, assets
+            ) {
+                self.buttons.push(btn);
+            }
 
-        // Road → World: clickable area at the top
-        self.load_overlay(&f, 16, 4, true, assets);
-        self.hotspots.push(Hotspot {
-            x: 0, y: 0, width: 640, height: 200,
-            name: "Straße → Weltkarte".into(),
-            target: Some(Scene::World),
-        });
+            // Road → World
+            self.load_overlay(&f, 16, 4, true, assets);
+            self.hotspots.push(Hotspot {
+                x: 0, y: 0, width: 640, height: 200,
+                name: "Straße → Weltkarte".into(),
+                target: Some(Scene::World),
+            });
+        } else {
+            // ── Door mode: both doors clickable → Garage, no road to World ──
+            if let Some(btn) = MulleButton::new(
+                "Seitentür → Werkstatt", &f, 13, Some(14),
+                Some(Scene::Garage), 5, assets
+            ) {
+                self.buttons.push(btn);
+            }
+
+            if let Some(btn) = MulleButton::new(
+                "Garagentor → Werkstatt", &f, 40, Some(41),
+                Some(Scene::Garage), 6, assets
+            ) {
+                self.buttons.push(btn);
+            }
+        }
     }
 
     // ─── World (05.DXR) ────────────────────────────────────────────────
@@ -698,6 +740,15 @@ impl SceneHandler {
         judge.set_talk_anims("talk", "idle");
         judge.play("idle");
         self.actors.push(judge);
+
+        // Score sprite at (177, 93) — 94.DXR members 17–21 (rating 1→17 … 5→21)
+        // Use the pre-computed rating to select the right member
+        let score_member = 16 + self.carshow_rating as u32; // 17..21
+        let mut score = Actor::new("score", 177, 93, 25);
+        score.add_animation("show", &[(&f, score_member)], 10, true, assets);
+        score.play("show");
+        score.visible = false; // Hidden until script reveals it
+        self.actors.push(score);
 
         // Mulle at (89, 337) looking left
         let b = "00.CXT";
@@ -937,7 +988,7 @@ impl SceneHandler {
 
     // ─── Utility ───────────────────────────────────────────────────────
 
-    fn resolve_file(&self, stem: &str, assets: &AssetStore) -> String {
+    pub(crate) fn resolve_file(&self, stem: &str, assets: &AssetStore) -> String {
         let dxr = format!("{}.DXR", stem);
         let cxt = format!("{}.CXT", stem);
         if assets.files.contains_key(&dxr) { dxr }
@@ -1007,6 +1058,17 @@ impl SceneHandler {
             }
         }
         tracing::warn!("set_actor_visible: actor '{}' not found", actor_name);
+    }
+
+    /// Change an actor's talk/silence animation pair (e.g. for carshow judge scoring)
+    pub fn set_actor_talk_anims(&mut self, actor_name: &str, talk: &str, silence: &str) {
+        for actor in &mut self.actors {
+            if actor.name == actor_name {
+                actor.set_talk_anims(talk, silence);
+                return;
+            }
+        }
+        tracing::warn!("set_actor_talk_anims: actor '{}' not found", actor_name);
     }
 
     /// Mark an actor as the one currently talking (for cue-point routing)
@@ -1275,24 +1337,24 @@ impl SceneHandler {
 
     // ─── Menu UI ────────────────────────────────────────────────────────
 
-    const NAME_FIELD_X: i32 = 364;
-    const NAME_FIELD_Y: i32 = 72;
-    const NAME_FIELD_W: i32 = 230;
+    const NAME_FIELD_X: i32 = 90;
+    const NAME_FIELD_Y: i32 = 60;
+    const NAME_FIELD_W: i32 = 180;
     const NAME_FIELD_H: i32 = 22;
 
-    const NAME_LIST_X: i32 = 364;
-    const NAME_LIST_Y: i32 = 110;
+    const NAME_LIST_X: i32 = 350;
+    const NAME_LIST_Y: i32 = 60;
     const NAME_LIST_W: i32 = 230;
     const NAME_LIST_H: i32 = 160;
-    const NAME_LIST_ITEM_H: i32 = 18;
+    const NAME_LIST_ITEM_H: i32 = 25;
 
-    const PLAY_BTN_X: i32 = 364;
-    const PLAY_BTN_Y: i32 = 286;
+    const PLAY_BTN_X: i32 = 350;
+    const PLAY_BTN_Y: i32 = 234;
     const PLAY_BTN_W: i32 = 110;
     const PLAY_BTN_H: i32 = 28;
 
-    const DELETE_BTN_X: i32 = 484;
-    const DELETE_BTN_Y: i32 = 286;
+    const DELETE_BTN_X: i32 = 470;
+    const DELETE_BTN_Y: i32 = 234;
     const DELETE_BTN_W: i32 = 110;
     const DELETE_BTN_H: i32 = 28;
 
@@ -1435,7 +1497,7 @@ impl SceneHandler {
             Self::DELETE_BTN_Y + (Self::DELETE_BTN_H - 8) / 2, dt, 0xFFFFFFFF);
 
         // Hint
-        font::draw_text_shadow(fb, Self::NAME_FIELD_X, Self::DELETE_BTN_Y + 40,
+        font::draw_text_shadow(fb, Self::NAME_LIST_X, Self::DELETE_BTN_Y + 40,
             "Enter=Spielen | F1-F9=Szene", 0xFFCCCCCC);
     }
 }

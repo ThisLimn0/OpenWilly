@@ -30,15 +30,18 @@ const MENU: &[MenuItem] = &[
     MenuItem { label: "Hitboxen anzeigen",     kind: ItemKind::Toggle },  // 2
     MenuItem { label: "Dialoge ueberspringen", kind: ItemKind::Toggle }, // 3
     MenuItem { label: "Meme-Modus",            kind: ItemKind::Toggle },  // 4
+    // ── Video ──
+    MenuItem { label: "Detail-Rauschen",       kind: ItemKind::Toggle },  // 5
     // ── Dev Triggers ──
-    MenuItem { label: "-> Werkstatt",          kind: ItemKind::Trigger }, // 5
-    MenuItem { label: "-> Hof",                kind: ItemKind::Trigger }, // 6
-    MenuItem { label: "-> Weltkarte",          kind: ItemKind::Trigger }, // 7
-    MenuItem { label: "-> Autoshow",           kind: ItemKind::Trigger }, // 8
-    MenuItem { label: "-> Schrottplatz",       kind: ItemKind::Trigger }, // 9
-    MenuItem { label: "Tank auffuellen",       kind: ItemKind::Trigger }, // 10
+    MenuItem { label: "-> Werkstatt",          kind: ItemKind::Trigger }, // 6
+    MenuItem { label: "-> Hof",                kind: ItemKind::Trigger }, // 7
+    MenuItem { label: "-> Weltkarte",          kind: ItemKind::Trigger }, // 8
+    MenuItem { label: "-> Autoshow",           kind: ItemKind::Trigger }, // 9
+    MenuItem { label: "-> Schrottplatz",       kind: ItemKind::Trigger }, // 10
+    MenuItem { label: "Tank auffuellen",       kind: ItemKind::Trigger }, // 11
+    MenuItem { label: "Figge in Werkstatt",    kind: ItemKind::Trigger }, // 12
     // ── Close ──
-    MenuItem { label: "Schliessen",            kind: ItemKind::Close },   // 11
+    MenuItem { label: "Schliessen",            kind: ItemKind::Close },   // 13
 ];
 
 // ─── Public types ───────────────────────────────────────────────────────
@@ -53,6 +56,8 @@ pub enum DevAction {
     GotoScene(Scene),
     /// Refill the driving car's fuel tank
     RefuelTank,
+    /// Set #FiggeIsComing and go to Garage to trigger Figge cutscene
+    TriggerFigge,
 }
 
 /// The dev menu state
@@ -66,6 +71,9 @@ pub struct DevMenu {
     pub show_hitboxes: bool,
     pub skip_dialogs: bool,
     pub meme_mode: bool,
+
+    // ── Video ──
+    pub detail_noise: bool,
 
     // ── Activation detector ──
     hash_times: Vec<Instant>,
@@ -83,6 +91,7 @@ impl DevMenu {
             show_hitboxes: false,
             skip_dialogs: false,
             meme_mode: false,
+            detail_noise: false,
             hash_times: Vec::new(),
         }
     }
@@ -205,7 +214,7 @@ impl DevMenu {
             }
 
             // Section dividers
-            if i == 5 || i == MENU.len() - 1 {
+            if i == 5 || i == 6 || i == MENU.len() - 1 {
                 font::draw_rect(fb, box_x + 10, iy - 2, box_w - 20, 1, 0xFF336644);
             }
 
@@ -265,6 +274,7 @@ impl DevMenu {
             2 => Some(self.show_hitboxes),
             3 => Some(self.skip_dialogs),
             4 => Some(self.meme_mode),
+            5 => Some(self.detail_noise),
             _ => None,
         }
     }
@@ -276,6 +286,7 @@ impl DevMenu {
             2 => self.show_hitboxes = !self.show_hitboxes,
             3 => self.skip_dialogs = !self.skip_dialogs,
             4 => self.meme_mode = !self.meme_mode,
+            5 => self.detail_noise = !self.detail_noise,
             _ => {}
         }
         let name = MENU.get(idx).map(|m| m.label).unwrap_or("?");
@@ -286,12 +297,13 @@ impl DevMenu {
     fn fire_trigger(&mut self, idx: usize) -> DevAction {
         self.open = false;
         match idx {
-            5 => DevAction::GotoScene(Scene::Garage),
-            6 => DevAction::GotoScene(Scene::Yard),
-            7 => DevAction::GotoScene(Scene::World),
-            8 => DevAction::GotoScene(Scene::CarShow),
-            9 => DevAction::GotoScene(Scene::Junkyard),
-            10 => DevAction::RefuelTank,
+            6 => DevAction::GotoScene(Scene::Garage),
+            7 => DevAction::GotoScene(Scene::Yard),
+            8 => DevAction::GotoScene(Scene::World),
+            9 => DevAction::GotoScene(Scene::CarShow),
+            10 => DevAction::GotoScene(Scene::Junkyard),
+            11 => DevAction::RefuelTank,
+            12 => DevAction::TriggerFigge,
             _ => DevAction::None,
         }
     }

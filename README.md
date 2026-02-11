@@ -1,241 +1,140 @@
 # OpenWilly
 
-🎮 **Compatibility wrapper for classic Willy Werkel (Mulle Meck) games on modern Windows systems**
+**Open-source reimplementation of the Willy Werkel (Mulle Meck) educational game engine in Rust**
 
 ![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)
 ![Rust](https://img.shields.io/badge/rust-1.75%2B-orange)
 
 ## About
 
-OpenWilly is a Rust-based compatibility layer that allows you to play classic Willy Werkel educational games from the late 1990s on modern Windows 10/11 systems. These games use **Macromedia Director 6** as their engine – the Director Player (WILLY32.EXE) still runs on modern Windows, but the 32-bit **Xtras** (MOA plugins) and CD-ROM requirements cause the games to fail.
+OpenWilly is a clean-room reimplementation of the game engine powering the classic Willy Werkel (known internationally as Mulle Meck / Gary Gadget) educational games from the late 1990s. Rather than wrapping or patching the original Macromedia Director 6 player, OpenWilly parses the original game data files (DXR/CXT casts, Director bitmaps, sounds) directly and runs them in a new Rust-based engine with a minifb-backed 640x480 renderer.
+
+The project draws heavily on the prior reverse-engineering work done by the **mulle.js** project (a Phaser.js-based reimplementation), which served as the primary reference for game logic, scene structure, part databases, cursor behavior, physics parameters, and many other behavioral details. Without mulle.js, this project would not exist in its current form.
 
 ### Supported Games
 
-- 🚗 **Autos bauen mit Willy Werkel** (1997)
-- ✈️ **Flugzeuge bauen mit Willy Werkel**
-- 🏠 **Häuser bauen mit Willy Werkel**
-- 🚀 **Raumschiffe bauen mit Willy Werkel**
-- 🚢 **Schiffe bauen mit Willy Werkel**
+- **Autos bauen mit Willy Werkel** (1997) -- primary development target
+- **Flugzeuge bauen mit Willy Werkel**
+- **Haeuser bauen mit Willy Werkel**
+- **Raumschiffe bauen mit Willy Werkel**
+- **Schiffe bauen mit Willy Werkel**
 
-## Features (Planned)
+## Approach
 
-- ✅ ISO mounting and extraction
-- ✅ CD-ROM check bypass
-- ✅ Macromedia Director compatibility (GDI32-based rendering)
-- ✅ Legacy API compatibility layer
-- ✅ Xtra plugin support (FILEIO, KEYPOLL, PMATIC)
-- ✅ Windowed and fullscreen modes
-- ✅ Modern resolution support
-- ✅ No external dependencies (dgVoodoo2, etc.)
-- ✅ User-friendly launcher GUI
+OpenWilly takes a **reimplementation** approach rather than a compatibility-wrapper approach:
+
+1. **Parse original Director data** -- DXR/CXT cast files are read directly using a custom Director 6 parser. Bitmaps, palettes, sounds, and cast metadata are extracted at runtime.
+2. **Reconstruct game logic from mulle.js** -- The mulle.js project reverse-engineered the Lingo scripts and game behavior into readable JavaScript. OpenWilly translates this logic into idiomatic Rust, including scene state machines, dialog systems, car building, driving physics, and quest progression.
+3. **Native rendering** -- A minifb window provides the 640x480 framebuffer. Sprites are alpha-blended and z-ordered. Nearest-neighbor scaling with optional detail noise handles arbitrary output resolutions.
+4. **No original executables needed** -- The original WILLY32.EXE (Director Player) and its Xtras are not used at runtime. Only the game data files (from the original CD/ISO) are required.
+
+### What mulle.js provided
+
+The [mulle.js](https://github.com/niclaslindstedt/mulle) project by Niclas Lindstedt is a JavaScript/Phaser.js reimplementation of "Bygg bilar med Mulle Meck" that decoded and documented large parts of the original game's behavior. OpenWilly uses mulle.js as a behavioral specification for:
+
+- Scene flow and state machine transitions
+- Parts database structure and snap-point geometry
+- Cursor types and hotspot coordinates (from style.scss)
+- Junkyard pile drop rectangles and bounce-back logic
+- Driving physics, engine sound state machines, and fuel mechanics
+- Destination scripts, NPC dialog chains, and quest flag conventions
+- Car show rating formulas and animation sequences
+- Dashboard HUD layout (fuel needle frames, speedometer z-ordering)
+- Morph/snap preview switching (junkView to UseView within 40px)
+- Gravity constants (800 px/s^2) and collision floors
+
+All game logic was rewritten from scratch in Rust; no JavaScript code was translated line-by-line.
 
 ## Architecture
 
-OpenWilly consists of several modular components:
+```
+openwilly-player       Standalone game engine (minifb + rodio)
+  src/
+    engine/            Renderer, font, sound engine, icon loader
+    game/              Game logic modules:
+      mod.rs           Central GameState, scene switching, update loop
+      scenes.rs        SceneHandler -- DXR loading, buttons, hotspots
+      build_car.rs     Car assembly, snap points, road-legality checks
+      driving.rs       DriveCar physics, engine sounds, mouse/key steering
+      drag_drop.rs     Drag-and-drop engine, snap preview, part physics
+      cursor.rs        Software cursor (9 types, stack-based management)
+      dashboard.rs     Fuel needle + speedometer HUD
+      toolbox.rs       Driving-view popup menu (5 buttons)
+      dialog.rs        Subtitle rendering, quest flags, mission database
+      scene_script.rs  Data-driven dialog/animation script chains
+      dev_menu.rs      Hidden developer menu (5x # activation)
+      parts_db.rs      Part properties, weights, categories
+      save.rs          Save/load game state
+    assets/            Director file parser, bitmap decoder, palette module
+    director/          DXR/CXT cast parsing, member extraction
 
-- **openwilly-launcher**: Main GUI application for game management
-- **openwilly-fileio**: FILEIO.X32 replacement – file I/O + CD-path bypass
-- **openwilly-keypoll**: KEYPOLL.X32 replacement – keyboard state polling
-- **openwilly-pmatic**: PMATIC.X32 stub – PrintOMatic (unused by games)
-- **openwilly-iso**: ISO9660 parsing and virtual filesystem
-- **openwilly-patcher**: Runtime DLL injection and API hooking
-- **openwilly-director**: Macromedia Director engine support (Xtras, DXR files)
-- **openwilly-media**: Video and audio playback (AVI, MCI)
-- **openwilly-common**: Shared utilities and types
+openwilly-iso          ISO 9660 parser for CD image mounting
+openwilly-launcher     (planned) GUI launcher for game management
+openwilly-fileio       FILEIO.X32 replacement DLL (legacy compatibility path)
+openwilly-keypoll      KEYPOLL.X32 replacement DLL (legacy compatibility path)
+```
 
-See [MASTERPLAN.md](MASTERPLAN.md) for detailed architecture documentation.
+The legacy DLL crates (fileio, keypoll) exist from an earlier compatibility-wrapper approach and are retained for reference but are not used by openwilly-player.
 
-## Quick Start
+## Building and Running
 
 ### Prerequisites
 
 - Windows 10/11 (x64)
 - Rust 1.75 or later
-- Visual Studio Build Tools (for Windows SDK)
-- Original game ISOs
+- Original game files (from CD or ISO image)
 
-### Building
+### Build
 
 ```powershell
-# Clone repository
-git clone https://github.com/yourusername/openwilly.git
-cd openwilly
-
-# Build all components
-cargo build --release
-
-# Run launcher
-cargo run --release -p openwilly-launcher
+cargo build --release -p openwilly-player
 ```
 
-### Usage
+### Run
 
-1. Launch the OpenWilly application
-2. Add your game ISOs to the library
-3. Select a game and click "Play"
-4. Enjoy!
+```powershell
+# Point to the directory containing the extracted game data
+cargo run --release -p openwilly-player -- --game-dir "C:\path\to\game\files"
+```
+
+The game directory must contain the Director cast files (DATA.CST, *.DXR, *.CXT) and asset folders (Movies/, Data/, Autos/, Xtras/).
 
 ## Development Status
 
-🚧 **Phase 1 – Making it Playable** (Active)
+The player is functional for "Autos bauen mit Willy Werkel" with the following systems implemented:
 
-- [x] Project planning and architecture
-- [x] Basic workspace setup  
-- [x] Game executable analysis (WILLY32.EXE is GDI32, not DirectDraw)
-- [x] Ghidra decompilation of all Xtras
-- [x] FILEIO.X32 Rust replacement (25 handlers, CD-path bypass)
-- [x] KEYPOLL.X32 Rust replacement (keyboard polling via MOA)
-- [x] PMATIC.X32 stub (PrintOMatic, unused by game scripts)
-- [ ] 32-bit DLL build & runtime test with Director
-- [ ] MOA value marshalling validation
-- [ ] Launcher GUI
-- [ ] First playable game
+- Director 6 DXR/CXT parser with bitmap decoding and palette support
+- Scene state machine (Boot, Menu, Garage, Junkyard, Yard, World, Destinations, CarShow)
+- Car building with snap points, attachment validation, and road-legality checks
+- Drag-and-drop with morph/snap preview (junkView/UseView switching)
+- Arcade-style part physics (gravity, floor collision, weight-based impact sounds)
+- Driving with keyboard and mouse steering, engine sound state machine (9 types x 7 states)
+- Dashboard HUD (16-frame fuel needle, speedometer)
+- Toolbox popup menu in driving view
+- Dialog system with cue-point sync, subtitle rendering, speaker color coding
+- Quest flags and mission delivery (Figge workshop cutscene)
+- Scene scripts for all destinations (82-94)
+- Car show with score rating and judge animation
+- Software cursor (9 types from 00.DXR, context-sensitive switching)
+- Transition cutscenes with progress bar
+- Save/load system
+- Developer menu with cheats, scene warps, and triggers
 
-See [MASTERPLAN.md](MASTERPLAN.md) for detailed roadmap.
+See [docs/GAPS.md](docs/GAPS.md) for the detailed gap tracking table comparing the reimplementation against mulle.js.
 
-## How It Works
-
-### The Problem
-
-These games were designed for Windows 95/98 and rely on:
-- **Macromedia Director 6 Player** (WILLY32.EXE) – the engine itself still runs on modern Windows
-- **Director Xtras** (FILEIO.X32, KEYPOLL.X32) – 32-bit MOA plugins compiled for Win95
-- **CD-ROM checks** – game expects data on a CD drive
-- **Hardcoded paths** – absolute paths to CD-ROM (D:\, E:\, etc.)
-
-### The Solution
-
-OpenWilly provides:
-
-1. **Xtra Replacements**: Drop-in Rust DLLs that replace the original Director Xtras (FILEIO.X32, KEYPOLL.X32, PMATIC.X32) with modern, working versions
-2. **CD-ROM Bypass**: Integrated path redirection from CD drive paths to local game directory
-3. **API Hooks**: Runtime hooks for file paths, registry access, and drive detection
-4. **ISO Extraction**: Extract game ISOs to eliminate CD-ROM requirement
-5. **Launcher**: User-friendly GUI for game management
-
-```
-┌──────────────────────┐
-│  WILLY32.EXE         │  (Original Director 6 Player)
-│  (Macromedia Director)│
-└──────┬───────────────┘
-       │ loads
-       ▼
-┌──────────────────┐ ┌──────────────┐ ┌──────────────┐
-│ FILEIO.X32  ✅   │ │ KEYPOLL.X32  │ │ PMATIC.X32   │
-│ (Rust replacement)│ │ (Rust)       │ │ (Rust stub)  │
-│ + CD-path bypass │ │ + Input      │ │ + Print stub │
-└──────────────────┘ └──────────────┘ └──────────────┘
-       │
-       ▼
-┌──────────────────┐
-│ GDI32 Rendering  │  (Native Windows – just works!)
-│ (no wrapper needed)│
-└──────────────────┘
-```
-
-## Project Structure
-
-```
-OpenWilly/
-├── crates/
-│   ├── openwilly-launcher/     # GUI launcher
-│   ├── openwilly-fileio/       # FILEIO.X32 replacement (CD bypass)
-│   ├── openwilly-keypoll/      # KEYPOLL.X32 replacement (keyboard)
-│   ├── openwilly-pmatic/       # PMATIC.X32 stub (print, unused)
-│   ├── openwilly-director/     # Director engine support
-│   ├── openwilly-patcher/      # API hooks & path redirection
-│   ├── openwilly-iso/          # ISO handling
-│   ├── openwilly-media/        # Video/Audio
-│   └── openwilly-common/       # Shared types
-├── tools/                      # Analysis & development tools
-├── docs/                       # Documentation
-├── mulle.js/                   # JS reference implementation (Phaser)
-├── autos-bauen/decomps/        # Ghidra decompilations
-├── export/                     # Extracted Director data
-├── MASTERPLAN.md               # Current development plan
-└── README.md                   # This file
-```
-
-## Contributing
-
-Contributions are welcome! This is a passion project to preserve classic educational games.
-
-### Areas Where Help Is Needed
-
-- 🔍 **Reverse Engineering**: MOA interface analysis, Director internals
-- 🔌 **Xtra Development**: Improving FILEIO/KEYPOLL implementations
-- 🎬 **Media Codecs**: AVI playback, MCI audio
-- 🎨 **GUI Design**: Launcher interface improvements
-- 📚 **Documentation**: Writing guides and documentation
-- 🐛 **Testing**: Playing games and reporting issues
-
-### Development Setup
-
-```powershell
-# Build all crates (host architecture)
-cargo build --workspace
-
-# Build 32-bit Xtra DLLs for Director
-cargo build --release --target i686-pc-windows-msvc -p openwilly-fileio -p openwilly-keypoll -p openwilly-pmatic
-```
-
-See [MASTERPLAN.md](MASTERPLAN.md) for detailed development information.
-
-## Legal & Licensing
+## Legal
 
 ### Project License
 
-OpenWilly is dual-licensed under:
-- MIT License
-- Apache License 2.0
-
-Choose whichever license works best for your use case.
+Dual-licensed under MIT and Apache 2.0. Choose whichever fits your needs.
 
 ### Game Rights
 
-**Important**: This project does NOT include any game files, assets, or copyrighted content. You must own the original games to use this software. OpenWilly is purely a compatibility layer to run software you already legally own on modern systems.
+This project contains no game files, assets, or copyrighted content. You must own the original games. OpenWilly reads the original data files at runtime and does not redistribute them.
 
-The Willy Werkel games are copyrighted by their respective owners (Möllers & Bellinghausen Verlag GmbH, Terzio, Levande Böcker).
+The Willy Werkel games are copyrighted by their respective owners (Levande Boecker / Moellers & Bellinghausen Verlag GmbH / Terzio).
 
 ## Credits
 
-- **Original Games**: Created by the talented developers at Levande Böcker
-- **Inspiration**: Projects like dgVoodoo2, Wine, and DXVK
-- **Community**: The game preservation community
-
-## Resources
-
-- [MASTERPLAN.md](MASTERPLAN.md) - Current development plan and architecture
-- [mulle.js/](mulle.js/) - JavaScript reference implementation (Phaser CE)
-- [autos-bauen/decomps/](autos-bauen/decomps/) - Ghidra decompilations of Xtras
-
-## Frequently Asked Questions
-
-### Do I need the original game CDs?
-
-Yes, you need to own the original games. OpenWilly works with ISO images of your legally owned game CDs.
-
-### Will this work on Linux/macOS?
-
-Currently Windows-only due to the nature of the games being Windows executables. Future support for Wine/Proton is possible but not planned.
-
-### Why Rust?
-
-Rust provides:
-- Memory safety (critical for hooking/injection)
-- Great Windows API bindings
-- Modern tooling and package management
-- Performance on par with C/C++
-- Active community
-
-### Can I help?
-
-Absolutely! See the Contributing section above.
-
-## Disclaimer
-
-This is a fan project for game preservation and education. It is not affiliated with or endorsed by the original game developers or publishers.
-
----
-
-Made with ❤️ for preserving childhood memories
+- **Original games**: Levande Boecker (Sweden) -- game design, art, and Lingo scripting
+- **mulle.js**: Niclas Lindstedt -- JavaScript/Phaser reimplementation that served as the behavioral reference for this project. Repository: https://github.com/niclaslindstedt/mulle

@@ -15,14 +15,18 @@
 //!   82-94  — Destinations (houses, shops, etc.)
 
 pub mod build_car;
+pub mod cursor;
+pub mod dashboard;
 pub mod dev_menu;
 pub mod dialog;
 pub mod drag_drop;
 pub mod driving;
+pub mod i18n;
 pub mod parts_db;
 pub mod save;
 pub mod scene_script;
 pub mod scenes;
+pub mod toolbox;
 
 use minifb::Key;
 use crate::assets::AssetStore;
@@ -36,6 +40,8 @@ use crate::game::parts_db::PartsDB;
 use crate::game::save::SaveManager;
 use crate::game::dev_menu::{DevMenu, DevAction};
 use crate::game::scene_script::{SceneScript, ScriptRequest, ScriptContext};
+use crate::game::cursor::GameCursor;
+use crate::game::i18n::Language;
 
 /// Which scene is active
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +84,22 @@ impl Scene {
     }
 }
 
+/// Get the 00.CXT cutscene member for a specific scene transition.
+/// Returns the member name (string-based lookup) or number, as a string.
+fn transition_cutscene(from: &Scene, to: &Scene, has_car: bool) -> Option<&'static str> {
+    match (from, to) {
+        (Scene::Menu, Scene::Garage)    => Some("00b011v0"),
+        (Scene::Yard, Scene::Garage) if !has_car => Some("00b011v0"), // side door / no car
+        (Scene::Yard, Scene::Garage) if has_car  => Some("00b015v0"), // garage door, car
+        (Scene::Yard, Scene::World)     => Some("00b008v0"),
+        (Scene::World, _)              => Some("00b008v0"), // destinations
+        (Scene::Garage, Scene::Junkyard) => None, // member 70 (numeric) — skip for now
+        (Scene::Junkyard, Scene::Garage) => None, // member 71 — skip for now
+        (Scene::Garage, Scene::Yard)    => None,  // member 67/68 — skip for now
+        _ => None,
+    }
+}
+
 /// Central game state
 pub struct GameState {
     pub assets: AssetStore,
@@ -108,6 +130,35 @@ pub struct GameState {
     pub active_script: Option<SceneScript>,
     /// Developer menu (hidden, activated by 5× '#')
     pub dev_menu: DevMenu,
+    /// Dashboard HUD (fuel needle + speedometer), loaded once
+    pub dashboard: Option<dashboard::Dashboard>,
+    /// Toolbox / popup menu for the world view
+    pub toolbox: Option<toolbox::Toolbox>,
+    /// Transition cutscene: bitmap + countdown frames + target scene
+    pub transition: Option<TransitionCutscene>,
+    /// Software-rendered cursor with stack-based type management
+    pub cursor: GameCursor,
+    /// UI language
+    pub language: Language,
+    /// Topology bitmap red channel (316×198) for terrain collision.
+    /// Loaded per map tile; indexed [y * 316 + x].
+    pub topo_data: Vec<u8>,
+}
+
+/// A brief cutscene image shown during scene transitions
+pub struct TransitionCutscene {
+    /// RGBA pixel data for the cutscene image
+    pub pixels: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub x: i32,
+    pub y: i32,
+    /// Countdown frames until transition completes
+    pub frames_left: u8,
+    /// Target scene to switch to after cutscene
+    pub target: Scene,
+    /// Progress bar position (0.0 = start, 1.0 = done)
+    pub progress: f32,
 }
 
 impl GameState {
@@ -129,6 +180,8 @@ impl GameState {
         tracing::info!("GameState initialized: {} missions loaded, {} parts in DB",
             missions.missions.len(), parts_db.len());
 
+        let cursor = GameCursor::new(&assets);
+
         let mut state = Self {
             assets,
             current_scene,
@@ -147,6 +200,12 @@ impl GameState {
             mouse_down: false,
             active_script: None,
             dev_menu: DevMenu::new(),
+            dashboard: None,
+            toolbox: None,
+            transition: None,
+            cursor,
+            language: Language::German,
+            topo_data: vec![0u8; (driving::TOPO_WIDTH * driving::TOPO_HEIGHT) as usize],
         };
 
         // Boot → Menu transition
@@ -155,6 +214,18 @@ impl GameState {
     }
 
     pub fn update(&mut self) {
+        // Transition cutscene: count down frames, then switch scene
+        if let Some(trans) = &mut self.transition {
+            trans.frames_left = trans.frames_left.saturating_sub(1);
+            trans.progress = 1.0 - (trans.frames_left as f32 / 15.0);
+            if trans.frames_left == 0 {
+                let target = trans.target.clone();
+                self.transition = None;
+                self.switch_scene(target);
+            }
+            return; // Don't process anything else during transition
+        }
+
         // Tick scene actors, collect animation events
         let scene_events = self.scene_handler.update(&self.assets);
         for event in &scene_events {
@@ -170,29 +241,127 @@ impl GameState {
         // Advance active scene script (destination dialog chains)
         self.advance_script();
 
+        // Part physics (gravity) in Garage and Yard
+        if self.current_scene == Scene::Garage || self.current_scene == Scene::Yard {
+            let hit_parts = self.scene_handler.drag_drop.update_physics();
+            for part_id in hit_parts {
+                // Weight-based floor impact sound
+                if let Some(snd) = &mut self.sound {
+                    let weight = self.parts_db.get(part_id)
+                        .map(|p| p.properties.weight)
+                        .unwrap_or(1);
+                    let sound_id = if weight >= 4 {
+                        "00e003v0"
+                    } else if weight >= 2 {
+                        "00e002v0"
+                    } else {
+                        "00e001v0"
+                    };
+                    snd.play_by_name(sound_id, &self.assets);
+                }
+            }
+        }
+
         // Driving physics when on the World map
         if self.current_scene == Scene::World {
-            if let Some(car) = &mut self.drive_car {
-                let event = car.update(&[], |_, _| 0);
+            // Borrow topo_data separately so the closure can read it while car is &mut
+            let topo = &self.topo_data;
+            let topo_w = driving::TOPO_WIDTH as usize;
+            // Look up objects for the current tile
+            let world_map = driving::WorldMap::default_map();
+            // Collect results from car update within inner scope to release borrow
+            let (drive_event, engine_sound, saved_session, new_tile_pos) = if let Some(car) = &mut self.drive_car {
+                let tile_objects = world_map.tile_at(car.tile_col, car.tile_row)
+                    .and_then(|tid| world_map.get_tile(tid))
+                    .map(|t| t.objects.as_slice())
+                    .unwrap_or(&[]);
+                let event = car.update(tile_objects, |tx, ty| {
+                    let idx = ty as usize * topo_w + tx as usize;
+                    if idx < topo.len() { topo[idx] } else { 0 }
+                });
+                let saved = match &event {
+                    driving::DriveEvent::ReachedDestination { .. } => Some(car.save_session()),
+                    _ => None,
+                };
+                let tile_pos = if let driving::DriveEvent::TileTransition { delta_col, delta_row } = &event {
+                    car.do_tile_transition(*delta_col, *delta_row);
+                    Some((car.tile_col, car.tile_row))
+                } else {
+                    None
+                };
+                let sound = car.engine_sound_update().map(|s| s.to_string());
+                (Some(event), sound, saved, tile_pos)
+            } else {
+                (None, None, None, None)
+            };
+
+            // Load new topology after tile transition (outside car borrow)
+            if let Some((col, row)) = new_tile_pos {
+                let world_map = driving::WorldMap::default_map();
+                if let Some(tid) = world_map.tile_at(col, row) {
+                    if let Some(tile) = world_map.get_tile(tid) {
+                        let topo_name = tile.topology.clone();
+                        self.load_topology(&topo_name);
+                    }
+                }
+            }
+
+            // Process events outside the car borrow
+            if let Some(event) = drive_event {
                 match event {
                     driving::DriveEvent::FuelEmpty => {
                         self.play_dialog("05d011v0"); // "Tank ist leer!"
                     }
                     driving::DriveEvent::ReachedDestination { object_id, dir_resource } => {
                         tracing::info!("Reached destination object {} → {}", object_id, dir_resource);
-                        // Parse dir_resource like "85" → Scene::Destination(85)
+                        if let Some(session) = saved_session {
+                            self.drive_session = session;
+                        }
                         if let Ok(n) = dir_resource.parse::<u8>() {
-                            self.drive_session = car.save_session();
                             self.switch_scene(Scene::Destination(n));
                         }
-                    }
-                    driving::DriveEvent::TileTransition { delta_col, delta_row } => {
-                        car.do_tile_transition(delta_col, delta_row);
                     }
                     driving::DriveEvent::TerrainBlocked { reason } => {
                         tracing::debug!("Terrain blocked: {}", reason);
                     }
-                    driving::DriveEvent::None => {}
+                    driving::DriveEvent::GasStation => {
+                        if let Some(snd) = &mut self.sound {
+                            snd.play_by_name("31e006v0", &self.assets);
+                        }
+                        tracing::info!("Refueling at gas station");
+                    }
+                    driving::DriveEvent::AnimalsBlocking { has_horn } => {
+                        if has_horn {
+                            // Honk horn, then play cow move sound
+                            let horn_type = self.car.properties().horn_type;
+                            let horn_sounds = ["05e050v0", "05e049v0", "05e044v0", "05e042v0", "05d013v0"];
+                            let idx = ((horn_type - 1) as usize).min(horn_sounds.len() - 1);
+                            if let Some(snd) = &mut self.sound {
+                                snd.play_by_name(horn_sounds[idx], &self.assets);
+                                snd.play_by_name("31e001v0", &self.assets);
+                            }
+                        } else {
+                            // No horn — blocked sound
+                            if let Some(snd) = &mut self.sound {
+                                snd.play_by_name("31d001v0", &self.assets);
+                            }
+                        }
+                    }
+                    driving::DriveEvent::HillSound { big } => {
+                        // Hill feedback sounds (from objects.hash Sounds array)
+                        let sound = if big { "31d005v0" } else { "31d004v0" };
+                        if let Some(snd) = &mut self.sound {
+                            snd.play_by_name(sound, &self.assets);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Play engine sound if state changed
+            if let Some(sound_id) = engine_sound {
+                if let Some(snd) = &mut self.sound {
+                    snd.play_by_name(&sound_id, &self.assets);
                 }
             }
         }
@@ -210,6 +379,59 @@ impl GameState {
             self.handle_dev_action(action);
             return;
         }
+
+        // Toolbox / popup menu in World scene
+        if self.current_scene == Scene::World {
+            if let Some(tb) = &mut self.toolbox {
+                // If popup is open, check popup buttons first
+                if tb.popup_open {
+                    if let Some(action) = tb.popup_hit(x, y) {
+                        match action {
+                            toolbox::PopupAction::Home => {
+                                tb.popup_open = false;
+                                self.switch_scene(Scene::Yard);
+                                return;
+                            }
+                            toolbox::PopupAction::Quit => {
+                                tb.popup_open = false;
+                                self.switch_scene(Scene::Menu);
+                                return;
+                            }
+                            toolbox::PopupAction::Cancel => {
+                                tb.popup_open = false;
+                            }
+                            _ => {
+                                // Steering / Diploma — not implemented
+                                tracing::debug!("Popup action {:?} not implemented", action);
+                            }
+                        }
+                    }
+                    return; // Popup absorbs all clicks when open
+                }
+
+                // Check toolbox icon click
+                if tb.icon_hit(x, y) {
+                    tb.toggle();
+                    // Stop engine sound when opening popup
+                    if tb.popup_open {
+                        if let Some(car) = &mut self.drive_car {
+                            car.engine_sound_state = None;
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Language button on menu screen (bottom-left corner, 20,440 to 180,470)
+        if self.current_scene == Scene::Menu {
+            if x >= 20 && x < 180 && y >= 440 && y < 470 {
+                self.language = self.language.next();
+                tracing::info!("Language switched to {}", self.language.code());
+                return;
+            }
+        }
+
         if let Some(next) = self.scene_handler.on_click(x, y, &self.assets) {
             self.switch_scene(next);
         }
@@ -250,6 +472,26 @@ impl GameState {
         self.mouse_x = x;
         self.mouse_y = y;
         self.mouse_down = down;
+
+        // Auto-switch to mouse steering when clicking during driving
+        if down && self.current_scene == Scene::World {
+            if let Some(car) = &mut self.drive_car {
+                car.key_steer = false;
+            }
+        }
+
+        // Update toolbox hover state
+        if self.current_scene == Scene::World {
+            if let Some(tb) = &mut self.toolbox {
+                let just_hovered = tb.update_hover(x, y);
+                if just_hovered {
+                    if let Some(snd) = &mut self.sound {
+                        snd.play_by_name(toolbox::TOOLBOX_HOVER_SOUND, &self.assets);
+                    }
+                }
+            }
+        }
+
         // Forward drag processing to scene handler
         let result = self.scene_handler.process_drag(x, y, down);
         self.handle_drop_result(result);
@@ -260,7 +502,118 @@ impl GameState {
             if let Some(item) = self.scene_handler.drag_drop.dragged_item() {
                 tracing::trace!("Dragging part #{} at ({}, {})", item.part_id, x, y);
             }
+            // Play snap/unsnap sound when morph preview toggles
+            if let Some(item) = self.scene_handler.drag_drop.dragged_item_mut() {
+                if !item.snap_sound_played {
+                    item.snap_sound_played = true;
+                    // Weight-based snap sound
+                    let weight = self.parts_db.get(item.part_id)
+                        .map(|p| p.properties.weight)
+                        .unwrap_or(1);
+                    let sound_id = if weight >= 4 {
+                        "03e003v2"
+                    } else if weight >= 2 {
+                        "03e003v1"
+                    } else {
+                        "03e003v0"
+                    };
+                    if let Some(snd) = &mut self.sound {
+                        snd.play_by_name(sound_id, &self.assets);
+                    }
+                }
+            }
         }
+
+        // ── Update software cursor type based on context ──
+        self.update_cursor(x, y);
+    }
+
+    /// Determine the correct cursor type for the current mouse position.
+    fn update_cursor(&mut self, x: i32, y: i32) {
+        use crate::game::cursor::CursorType;
+
+        self.cursor.reset();
+
+        // Dragging a part → Grab
+        if self.scene_handler.drag_drop.is_dragging() {
+            self.cursor.set(CursorType::Grab);
+            return;
+        }
+
+        // In Garage or Junkyard: check if hovering a drag-drop item (car part)
+        if self.current_scene == Scene::Garage || self.current_scene == Scene::Junkyard {
+            if self.scene_handler.drag_drop.hover_info(x, y).is_some() {
+                self.cursor.set(CursorType::Grab);
+                return;
+            }
+            // Garage: hovering over a car part
+            if self.current_scene == Scene::Garage {
+                if self.car.part_at(x, y).is_some() {
+                    self.cursor.set(CursorType::Grab);
+                    return;
+                }
+            }
+        }
+
+        // Check buttons — these are clickable scene buttons (doors, nav)
+        for btn in &self.scene_handler.buttons {
+            if btn.hit_test(x, y) {
+                // Determine direction from button name
+                let name = btn.name.to_lowercase();
+                if name.contains("links") || name.contains("left")
+                    || name.contains("tür → werkstatt")
+                    || name.contains("← ")
+                {
+                    self.cursor.set(CursorType::Left);
+                } else if name.contains("rechts") || name.contains("right")
+                    || name.contains("→ werkstatt")
+                    || name.contains(" →")
+                {
+                    self.cursor.set(CursorType::Right);
+                } else if name.contains("zurück") || name.contains("back") {
+                    self.cursor.set(CursorType::Back);
+                } else {
+                    self.cursor.set(CursorType::Click);
+                }
+                return;
+            }
+        }
+
+        // Check interactive sprites (top z-order first)
+        let mut best_z = i32::MIN;
+        let mut found_interactive = false;
+        for sprite in &self.scene_handler.sprites {
+            if sprite.interactive && sprite.hit_test(x, y) && sprite.z_order > best_z {
+                best_z = sprite.z_order;
+                found_interactive = true;
+            }
+        }
+        if found_interactive {
+            self.cursor.set(CursorType::Click);
+            return;
+        }
+
+        // Hotspots
+        for hs in &self.scene_handler.hotspots {
+            if x >= hs.x && x < hs.x + hs.width as i32
+                && y >= hs.y && y < hs.y + hs.height as i32
+            {
+                self.cursor.set(CursorType::Click);
+                return;
+            }
+        }
+
+        // Toolbox icon in World
+        if self.current_scene == Scene::World {
+            if let Some(tb) = &self.toolbox {
+                if tb.icon_hit(x, y) {
+                    self.cursor.set(CursorType::Click);
+                    return;
+                }
+            }
+        }
+
+        // Default: Standard (already set by reset)
     }
 
     fn handle_drop_result(&mut self, result: drag_drop::DropResult) {
@@ -378,11 +731,34 @@ impl GameState {
 
     /// Update driving input from polled key state (call each frame from engine)
     pub fn update_drive_keys(&mut self, up: bool, down: bool, left: bool, right: bool) {
+        // Don't process driving input when popup menu is open
+        if let Some(tb) = &self.toolbox {
+            if tb.popup_open {
+                if let Some(car) = &mut self.drive_car {
+                    car.throttle = false;
+                    car.braking = false;
+                    car.steer_left = false;
+                    car.steer_right = false;
+                }
+                return;
+            }
+        }
+
         if let Some(car) = &mut self.drive_car {
-            car.throttle = up;
-            car.braking = down;
-            car.steer_left = left;
-            car.steer_right = right;
+            // Auto-switch: arrow keys → keyboard mode
+            if up || down || left || right {
+                car.key_steer = true;
+            }
+
+            if car.key_steer {
+                car.throttle = up;
+                car.braking = down;
+                car.steer_left = left;
+                car.steer_right = right;
+            } else {
+                // Mouse mode: apply mouse steering
+                car.mouse_steer(self.mouse_x, self.mouse_y, self.mouse_down);
+            }
         }
     }
 
@@ -406,7 +782,52 @@ impl GameState {
 
     /// Draw UI overlays (text fields, buttons, subtitles) on top of sprites
     pub fn draw_ui(&mut self, fb: &mut [u32]) {
+        // Transition cutscene: render image + progress bar
+        if let Some(trans) = &self.transition {
+            // Black background
+            fb.fill(0xFF000000);
+            // Blit cutscene image centered
+            let bw = trans.width as i32;
+            let bh = trans.height as i32;
+            for sy in 0..bh {
+                let dy = trans.y + sy;
+                if dy < 0 || dy >= 480 { continue; }
+                for sx in 0..bw {
+                    let dx = trans.x + sx;
+                    if dx < 0 || dx >= 640 { continue; }
+                    let si = (sy * bw + sx) as usize * 4;
+                    if si + 3 >= trans.pixels.len() { continue; }
+                    let a = trans.pixels[si + 3] as u32;
+                    if a == 0 { continue; }
+                    let r = trans.pixels[si] as u32;
+                    let g = trans.pixels[si + 1] as u32;
+                    let b = trans.pixels[si + 2] as u32;
+                    let di = dy as usize * 640 + dx as usize;
+                    fb[di] = 0xFF000000 | (r << 16) | (g << 8) | b;
+                }
+            }
+            // Progress bar: green on gray, at (170, 400), 300×32px
+            font::draw_rect(fb, 170, 400, 300, 32, 0xFF333333);
+            let bar_w = (300.0 * trans.progress) as i32;
+            if bar_w > 0 {
+                font::draw_rect(fb, 170, 400, bar_w, 32, 0xFF65C265);
+            }
+            return; // Don't draw normal UI during transition
+        }
+
         self.scene_handler.draw_ui(fb);
+
+        // Language selector on menu screen
+        if self.current_scene == Scene::Menu {
+            let lang_text = i18n::t(self.language, "lang_label");
+            // Button background
+            font::draw_rect(fb, 20, 440, 160, 26, 0xAA1a1a2e);
+            font::draw_rect_outline(fb, 20, 440, 160, 26, 0xFF6666CC);
+            // Centered text
+            let tw = font::text_width(lang_text);
+            let tx = 20 + (160 - tw) / 2;
+            font::draw_text_shadow(fb, tx, 446, lang_text, 0xFFFFFFFF);
+        }
 
         // Subtitle rendering at screen bottom
         if let Some(sub) = self.dialog.current_subtitle() {
@@ -431,23 +852,14 @@ impl GameState {
             }
         }
 
-        // Driving HUD: fuel gauge + speed
+        // Driving HUD: debug overlay (sprite-based dashboard handles fuel + speed)
         if self.current_scene == Scene::World {
             if let Some(car) = &self.drive_car {
-                let fuel_pct = car.fuel_percent();
-                let bar_w = (120.0 * fuel_pct) as i32;
-                font::draw_rect(fb, 10, 440, 122, 12, 0xFF333333);
-                let fuel_color = if fuel_pct > 0.3 { 0xFF00CC00 } else { 0xFFCC0000 };
-                font::draw_rect(fb, 11, 441, bar_w, 10, fuel_color);
-                font::draw_text(fb, 11, 430, "Benzin", 0xFFCCCCCC);
-
-                let speed_text = format!("{}km/h", (car.speed * 30.0) as i32);
-                font::draw_text_shadow(fb, 140, 440, &speed_text, 0xFFFFFFFF);
-
                 // Show engine type and FPS in debug
                 let (wo_x, wo_y) = car.wheel_offset();
-                let debug_text = format!("Motor:{} FPS:{} Rad:({:.0},{:.0})",
-                    car.engine_type(), driving::DriveCar::fps(), wo_x, wo_y);
+                let debug_text = format!("Motor:{} FPS:{} Rad:({:.0},{:.0}) {:.0}km/h Fuel:{:.0}%",
+                    car.engine_type(), driving::DriveCar::fps(), wo_x, wo_y,
+                    car.speed * 30.0, car.fuel_percent() * 100.0);
                 font::draw_text(fb, 10, 10, &debug_text, 0xFF888888);
             }
         }
@@ -455,10 +867,11 @@ impl GameState {
         // Road legality indicator in Garage
         if self.current_scene == Scene::Garage {
             if self.car.is_road_legal() {
-                font::draw_text_shadow(fb, 10, 460, "Fahrtauglich!", 0xFF00FF00);
+                font::draw_text_shadow(fb, 10, 460, i18n::t(self.language, "road_legal"), 0xFF00FF00);
             } else {
                 let failures = self.car.properties().road_legal_failures();
-                let hint = format!("Noch nicht fahrtauglich ({})", failures.join(", "));
+                let prefix = i18n::t(self.language, "not_road_legal");
+                let hint = format!("{} ({})", prefix, failures.join(", "));
                 font::draw_text_shadow(fb, 10, 460, &hint, 0xFFFF4444);
             }
         }
@@ -483,6 +896,11 @@ impl GameState {
                     tracing::warn!("Dev: no driving car to refuel");
                 }
             }
+            DevAction::TriggerFigge => {
+                self.save_manager.add_stuff("#FiggeIsComing");
+                tracing::info!("Dev: set #FiggeIsComing, switching to Garage");
+                self.switch_scene(Scene::Garage);
+            }
         }
     }
 
@@ -497,7 +915,7 @@ impl GameState {
             sprites.sort_by_key(|s| s.z_order);
         }
 
-        // On World map, render the driving car sprite
+        // On World map, render the driving car sprite + dashboard HUD
         if self.current_scene == Scene::World {
             if let Some(car) = &self.drive_car {
                 let member = car.sprite_member();
@@ -516,6 +934,23 @@ impl GameState {
                         member_num: member,
                     };
                     sprites.push(car_sprite);
+                }
+
+                // Dashboard HUD: fuel needle + speedometer
+                if let Some(dash) = &self.dashboard {
+                    let fuel_pct = car.fuel_percent();
+                    let speed = car.speed;
+                    let max_speed = car.max_speed();
+                    for ds in dash.sprites(fuel_pct, speed, max_speed) {
+                        sprites.push(ds);
+                    }
+                }
+            }
+
+            // Toolbox icon + popup menu
+            if let Some(tb) = &self.toolbox {
+                for ts in tb.sprites() {
+                    sprites.push(ts);
                 }
             }
         }
@@ -631,6 +1066,31 @@ impl GameState {
             if let Some(snd) = &mut self.sound {
                 snd.play_by_name(sound_id, &self.assets);
             }
+        }
+    }
+
+    /// Figge delivers up to 3 JunkMan parts to the yard
+    fn figge_give_parts(&mut self) {
+        // JunkMan parts list (from mulle.js savedata.js)
+        const JUNKMAN_PARTS: [u32; 52] = [
+            13, 20, 17, 89, 290, 120, 18, 19, 173, 21, 297, 22, 24, 25, 185, 26,
+            27, 28, 32, 35, 91, 132, 129, 134, 137, 146, 149, 154, 168, 216, 174,
+            175, 177, 189, 191, 192, 193, 233, 199, 208, 209, 212, 221, 227, 229,
+            235, 251, 264, 278, 294, 295, 14,
+        ];
+
+        let mut given = 0;
+        for &part_id in &JUNKMAN_PARTS {
+            if given >= 3 { break; }
+            // Only give parts the player doesn't already own
+            if !self.save_manager.has_yard_part(part_id) {
+                self.save_manager.add_yard_part(part_id);
+                tracing::info!("Figge gave JunkMan part {} to yard", part_id);
+                given += 1;
+            }
+        }
+        if given == 0 {
+            tracing::info!("Figge had no new parts to deliver");
         }
     }
 
@@ -764,6 +1224,14 @@ impl GameState {
                 ScriptRequest::SetActorVisible { actor_name, visible } => {
                     self.scene_handler.set_actor_visible(&actor_name, visible);
                 }
+                ScriptRequest::SetTalkAnims { actor_name, talk_anim, silence_anim } => {
+                    self.scene_handler.set_actor_talk_anims(&actor_name, &talk_anim, &silence_anim);
+                }
+                ScriptRequest::PlaySound(sound_id) => {
+                    if let Some(snd) = &mut self.sound {
+                        snd.play_by_name(&sound_id, &self.assets);
+                    }
+                }
                 ScriptRequest::LeaveToWorld => {
                     leave = true;
                 }
@@ -788,6 +1256,31 @@ impl GameState {
     fn switch_scene(&mut self, scene: Scene) {
         tracing::info!("Scene transition: {:?} -> {:?} ({})", self.current_scene, scene, scene.director_file());
 
+        // Check for transition cutscene (only if we're not already resuming from one)
+        if self.transition.is_none() {
+            let has_car = self.car.properties().is_road_legal();
+            if let Some(cutscene_name) = transition_cutscene(&self.current_scene, &scene, has_car) {
+                // Look up the cutscene member by name in 00.CXT
+                if let Some((fname, num)) = self.assets.find_sound_by_name(cutscene_name) {
+                    if let Some(bmp) = self.assets.decode_bitmap_transparent(&fname, num) {
+                        let cx = (640 - bmp.width as i32) / 2;
+                        let cy = (480 - bmp.height as i32) / 2;
+                        self.transition = Some(TransitionCutscene {
+                            pixels: bmp.pixels,
+                            width: bmp.width,
+                            height: bmp.height,
+                            x: cx,
+                            y: cy,
+                            frames_left: 15, // ~0.5 seconds at 30fps
+                            target: scene,
+                            progress: 0.0,
+                        });
+                        return; // Don't switch yet — cutscene plays first
+                    }
+                }
+            }
+        }
+
         // Log the active dialog audio_id if still talking when switching
         if self.dialog.is_talking() {
             if let Some(d) = &self.dialog.active_dialog {
@@ -802,6 +1295,9 @@ impl GameState {
         if let Some(snd) = &mut self.sound {
             snd.stop_all();
         }
+
+        // Reset cursor stack on scene switch (like mulle.js MulleState.create)
+        self.cursor.reset();
 
         // --- Scene exit logic ---
         match self.current_scene {
@@ -861,13 +1357,30 @@ impl GameState {
             // Load world map skeleton (tile/object data)
             let world_map = driving::WorldMap::default_map();
             let start_tile_id = world_map.tile_at(world_map.start_tile.0, world_map.start_tile.1);
+            let mut start_topo = String::new();
             if let Some(tid) = start_tile_id {
                 if let Some(tile) = world_map.get_tile(tid) {
+                    start_topo = tile.topology.clone();
                     tracing::info!("World map loaded: start tile {} ('{}', topo='{}'), {} objects, start_dir={}",
                         tile.id, tile.map_image, tile.topology, tile.objects.len(),
                         world_map.start_direction);
                     tracing::debug!("Start pos: ({:.0}, {:.0})", world_map.start_pos.0, world_map.start_pos.1);
                 }
+            }
+
+            // Determine start topology — use restored session tile if resuming
+            let topo_name = if self.drive_session.active {
+                let col = self.drive_session.tile_col;
+                let row = self.drive_session.tile_row;
+                world_map.tile_at(col, row)
+                    .and_then(|tid| world_map.get_tile(tid))
+                    .map(|t| t.topology.clone())
+                    .unwrap_or(start_topo)
+            } else {
+                start_topo
+            };
+            if !topo_name.is_empty() {
+                self.load_topology(&topo_name);
             }
 
             // Restore previous session if active
@@ -878,6 +1391,19 @@ impl GameState {
             }
 
             self.drive_car = Some(drive_car);
+
+            // Load dashboard HUD (once)
+            if self.dashboard.is_none() {
+                self.dashboard = dashboard::Dashboard::new(&self.assets);
+            }
+            // Load toolbox (once)
+            if self.toolbox.is_none() {
+                self.toolbox = Some(toolbox::Toolbox::new(&self.assets));
+            }
+            // Reset popup state on each World entry
+            if let Some(tb) = &mut self.toolbox {
+                tb.popup_open = false;
+            }
         }
 
         // --- Login on menu → garage transition ---
@@ -899,20 +1425,40 @@ impl GameState {
 
         self.current_scene = scene;
         let has_car = self.car.is_road_legal();
-        self.scene_handler = scenes::SceneHandler::new(scene, &self.assets, has_car);
 
-        // Activate scene script for destinations
-        if let Scene::Destination(n) = scene {
-            self.active_script = scene_script::build_destination_script(n);
-            if self.active_script.is_some() {
-                tracing::info!("Destination {} script activated", n);
-            }
+        // For CarShow, compute rating and pass it to the scene handler
+        if scene == Scene::CarShow {
+            let ff = self.car.properties().funny_factor;
+            let rating = scene_script::carshow_rating(ff);
+            self.scene_handler = scenes::SceneHandler::new_with_rating(scene, &self.assets, has_car, rating);
+            self.active_script = Some(scene_script::build_carshow_script(ff));
+            tracing::info!("CarShow: funny_factor={}, rating={}", ff, rating);
         } else {
-            self.active_script = None;
+            self.scene_handler = scenes::SceneHandler::new(scene, &self.assets, has_car);
+
+            // Activate scene script for destinations
+            if let Scene::Destination(n) = scene {
+                self.active_script = scene_script::build_destination_script(n);
+                if self.active_script.is_some() {
+                    tracing::info!("Destination {} script activated", n);
+                }
+            } else {
+                self.active_script = None;
+            }
         }
 
         // --- Scene entry setup ---
         if scene == Scene::Garage {
+            // Check for Figge delivery cutscene
+            // Trigger: has #FiggeIsComing flag (set when leaving dest 92 with #ExtraTank)
+            if self.save_manager.has_stuff("#FiggeIsComing") && self.active_script.is_none() {
+                self.save_manager.remove_stuff("#FiggeIsComing");
+                self.active_script = Some(scene_script::build_figge_script());
+                // Give up to 3 junkman parts to the yard
+                self.figge_give_parts();
+                tracing::info!("Figge garage cutscene activated");
+            }
+
             // Populate snap targets from car attachment points
             let free_points = self.car.free_attachment_points();
             for (id, wx, wy) in &free_points {
@@ -965,7 +1511,8 @@ impl GameState {
                     interactive: true,
                     member_num: pid,
                 };
-                let item = drag_drop::DraggableItem::new(pid, x, y, junk_sprite, 100 + i as i32);
+                let mut item = drag_drop::DraggableItem::new(pid, x, y, junk_sprite, 100 + i as i32);
+                item.physics_enabled = true;
                 self.scene_handler.drag_drop.add_item(item);
             }
         }
@@ -980,6 +1527,40 @@ impl GameState {
             .unwrap_or(1)
     }
 
+    /// Load a topology bitmap by member name (e.g. "30t001v0") into `topo_data`.
+    /// Extracts the red channel of each pixel into the 316x198 array.
+    fn load_topology(&mut self, topo_name: &str) {
+        // Topology bitmaps live in 05.DXR (world map file)
+        let file = self.scene_handler.resolve_file("05", &self.assets);
+        // Find member by name
+        if let Some(df) = self.assets.files.get(&file) {
+            let member_num = df.cast_members.iter()
+                .find(|(_, m)| m.name == topo_name)
+                .map(|(n, _)| *n);
+            if let Some(num) = member_num {
+                if let Some(bmp) = self.assets.decode_bitmap(&file, num) {
+                    let tw = driving::TOPO_WIDTH as usize;
+                    let th = driving::TOPO_HEIGHT as usize;
+                    self.topo_data.resize(tw * th, 0);
+                    // Extract red channel — bitmap is RGBA, 4 bytes per pixel
+                    for y in 0..th.min(bmp.height as usize) {
+                        for x in 0..tw.min(bmp.width as usize) {
+                            let si = (y * bmp.width as usize + x) * 4;
+                            if si < bmp.pixels.len() {
+                                self.topo_data[y * tw + x] = bmp.pixels[si]; // R channel
+                            }
+                        }
+                    }
+                    tracing::info!("Topology '{}' loaded: {}x{}", topo_name, bmp.width, bmp.height);
+                    return;
+                }
+            }
+        }
+        // Fallback: all road (0)
+        tracing::warn!("Topology '{}' not found, using flat road", topo_name);
+        self.topo_data.fill(0);
+    }
+
     /// Trigger sounds appropriate for the current scene
     fn play_scene_sounds(&mut self) {
         let snd = match &mut self.sound {
@@ -992,8 +1573,11 @@ impl GameState {
 
         match self.current_scene {
             Scene::Menu => {
-                // Menu music / ambient — 10e001v0 or 10e002v0
-                snd.play_background("10e001v0", &self.assets);
+                // Intro jingle — one-shot, NOT a loop (10e001v0 is a short jingle)
+                snd.play_by_name("10e001v0", &self.assets);
+                // Ambient background — 10e002v0 (loops)
+                // TODO: proper sequencing: play 10e002v0 only after 10e001v0 finishes
+                snd.play_background("10e002v0", &self.assets);
                 // Mulle greeting — 11d001v0 (one-shot dialog)
                 snd.play_by_name("11d001v0", &self.assets);
             }
