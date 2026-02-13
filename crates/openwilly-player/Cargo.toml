@@ -1,0 +1,38 @@
+[package]
+name = "openwilly-player"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Modern Rust player for Willy Werkel (Director 6) games"
+
+[[bin]]
+name = "openwilly"
+path = "src/main.rs"
+
+[dependencies]
+# Rendering + Windowing (pure Rust, no C deps)
+minifb = "0.27"
+
+# Data parsing
+byteorder = "1.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Audio playback
+rodio = "0.19"
+
+# ISO reading (for direct-from-ISO loading)
+iso9660 = "0.1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Random number generation (for random destinations)
+rand = "0.8"
+
