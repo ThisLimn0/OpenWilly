@@ -81,18 +81,19 @@ impl CursorType {
         CursorType::MoveIn,
     ];
 
-    /// Director cast member name used for name-based fallback lookup
+    /// Director cast member name used for name-based fallback lookup.
+    /// In 00.CXT the members are named "C_standard", "C_Grab", etc.
     fn director_name(self) -> &'static str {
         match self {
-            CursorType::Standard  => "Standard",
-            CursorType::Grab      => "Grab",
-            CursorType::Left      => "Left",
-            CursorType::Click     => "Click",
-            CursorType::Back      => "Back",
-            CursorType::Right     => "Right",
-            CursorType::MoveLeft  => "MoveLeft",
-            CursorType::MoveRight => "MoveRight",
-            CursorType::MoveIn    => "MoveIn",
+            CursorType::Standard  => "C_standard",
+            CursorType::Grab      => "C_Grab",
+            CursorType::Left      => "C_Left",
+            CursorType::Click     => "C_Click",
+            CursorType::Back      => "C_Back",
+            CursorType::Right     => "C_Right",
+            CursorType::MoveLeft  => "C_MoveLeft",
+            CursorType::MoveRight => "C_MoveRight",
+            CursorType::MoveIn    => "C_MoveIn",
         }
     }
 }
@@ -136,17 +137,20 @@ impl GameCursor {
         for ct in &CursorType::ALL {
             let (hx, hy) = ct.hotspot();
 
-            // Primary: try member number directly
-            let bmp = assets.decode_bitmap_transparent(file, ct.member())
-                // Fallback: search by member name
-                .or_else(|| {
-                    let name = ct.director_name();
-                    let df = assets.files.get(file)?;
+            // Primary: search by Director cast member name (reliable across DXR/CXT builds
+            // where member numbering differs)
+            let bmp = {
+                let name = ct.director_name();
+                let df = assets.files.get(file);
+                df.and_then(|df| {
                     let (&num, _) = df.cast_members.iter()
-                        .find(|(_, m)| m.name == name && m.cast_type == crate::assets::director::CastType::Bitmap)?;
+                        .find(|(_, m)| m.name.eq_ignore_ascii_case(name) && m.cast_type == crate::assets::director::CastType::Bitmap)?;
                     tracing::debug!("Cursor: resolved {:?} by name '{}' → member {}", ct, name, num);
                     assets.decode_bitmap_transparent(file, num)
-                });
+                })
+            }
+            // Fallback: try hardcoded member number (DXR layout)
+            .or_else(|| assets.decode_bitmap_transparent(file, ct.member()));
 
             if let Some(bmp) = bmp {
                 frames.push(CursorFrame {

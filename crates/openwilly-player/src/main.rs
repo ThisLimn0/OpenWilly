@@ -194,9 +194,9 @@ fn extract_iso_to_cache(iso_path: &Path) -> Result<PathBuf> {
         iso_path.display(),
         cache_dir.display()
     );
-    println!("Extracting game data from ISO...");
-    println!("  Source: {}", iso_path.display());
-    println!("  Target: {}", cache_dir.display());
+    tracing::info!("Extracting game data from ISO...");
+    tracing::info!("  Source: {}", iso_path.display());
+    tracing::info!("  Target: {}", cache_dir.display());
 
     std::fs::create_dir_all(&cache_dir)
         .with_context(|| format!("Failed to create {}", cache_dir.display()))?;
@@ -204,7 +204,7 @@ fn extract_iso_to_cache(iso_path: &Path) -> Result<PathBuf> {
     extract_iso_contents(iso_path, &cache_dir)?;
 
     let file_count = count_game_files(&cache_dir);
-    println!("  Extracted {} game files.", file_count);
+    tracing::info!("  Extracted {} game files.", file_count);
 
     if !is_game_dir(&cache_dir) {
         anyhow::bail!(
@@ -283,7 +283,7 @@ fn extract_iso_contents(iso_path: &Path, target: &Path) -> Result<()> {
 
                             let size = iso_file.size();
                             if size > 1_000_000 {
-                                println!(
+                                tracing::info!(
                                     "  {} ({:.1} MB)",
                                     rel_path,
                                     size as f64 / 1_000_000.0
@@ -301,7 +301,7 @@ fn extract_iso_contents(iso_path: &Path, target: &Path) -> Result<()> {
             // iso9660 crate fails on some ISOs (e.g. null-filled timestamps).
             // Fall back to our own robust raw parser.
             tracing::warn!("iso9660 crate failed ({}), using fallback parser", e);
-            println!("  Note: using fallback ISO parser...");
+            tracing::info!("  Note: using fallback ISO parser...");
             extract_iso_raw(iso_path, target)
         }
     }
@@ -494,7 +494,7 @@ fn extract_iso_directory_raw(
                     out.write_all(&data)?;
 
                     if data_length > 1_000_000 {
-                        println!(
+                        tracing::info!(
                             "  {} ({:.1} MB)",
                             entry_path,
                             data_length as f64 / 1_000_000.0

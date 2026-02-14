@@ -282,6 +282,10 @@ pub struct MulleButton {
     pub target: Option<Scene>,
     pub z_order: i32,
     pub visible: bool,
+    /// Sound to play on click (mulle.js `soundDefault`)
+    pub sound_default: Option<String>,
+    /// Sound to play on hover enter (mulle.js `soundHover`)
+    pub sound_hover: Option<String>,
 }
 
 impl MulleButton {
@@ -327,6 +331,8 @@ impl MulleButton {
             target,
             z_order,
             visible: true,
+            sound_default: None,
+            sound_hover: None,
         })
     }
 
@@ -553,23 +559,44 @@ impl SceneHandler {
         self.load_bg(f, 33, assets);
 
         // Door → Junkyard: #34 default, #35 hover
-        if let Some(btn) = MulleButton::new(
+        if let Some(mut btn) = MulleButton::new(
             "Tür → Schrottplatz", f, 34, Some(35), 320, 240, Some(Scene::Junkyard), 5, assets
         ) {
+            btn.sound_default = Some("02e015v0".into());
+            btn.sound_hover = Some("02e016v0".into());
+            // DropTarget: drag parts onto junkyard door → pile1
+            self.drag_drop.drop_targets.push(crate::game::drag_drop::DropTarget {
+                x: btn.x, y: btn.y, width: btn.width, height: btn.height,
+                id: "door_junk".into(), name: "Tür → Schrottplatz".into(),
+            });
             self.buttons.push(btn);
         }
 
         // Door → Yard (garage door, with car): #36 default, #37 hover
-        if let Some(btn) = MulleButton::new(
+        if let Some(mut btn) = MulleButton::new(
             "Garagentor → Hof", f, 36, Some(37), 320, 240, Some(Scene::Yard), 5, assets
         ) {
+            btn.sound_default = Some("02e015v0".into());
+            btn.sound_hover = Some("02e016v0".into());
+            // DropTarget: drag parts onto garage door → yard
+            self.drag_drop.drop_targets.push(crate::game::drag_drop::DropTarget {
+                x: btn.x, y: btn.y, width: btn.width, height: btn.height,
+                id: "door_yard".into(), name: "Garagentor → Hof".into(),
+            });
             self.buttons.push(btn);
         }
 
         // Side door → Yard (without car): #38 default, #39 hover
-        if let Some(btn) = MulleButton::new(
+        if let Some(mut btn) = MulleButton::new(
             "Seitentür → Hof", f, 38, Some(39), 320, 240, Some(Scene::Yard), 5, assets
         ) {
+            btn.sound_default = Some("02e015v0".into());
+            btn.sound_hover = Some("02e016v0".into());
+            // DropTarget: drag parts onto side door → yard
+            self.drag_drop.drop_targets.push(crate::game::drag_drop::DropTarget {
+                x: btn.x, y: btn.y, width: btn.width, height: btn.height,
+                id: "door_yard".into(), name: "Seitentür → Hof".into(),
+            });
             self.buttons.push(btn);
         }
 
@@ -586,7 +613,7 @@ impl SceneHandler {
             (b, 271), (b, 272), (b, 273), (b, 274), (b, 275), (b, 276),
         ], 10, false, assets);
         mulle.add_animation("lookLeft", &[(b, 283)], 10, true, assets);
-        mulle.play("lookPlayer");
+        mulle.play("idle");
         self.actors.push(mulle);
 
         // Figge actor at the side door (hidden until triggered)
@@ -645,28 +672,84 @@ impl SceneHandler {
         }
 
         // Door → Garage
-        if let Some(btn) = MulleButton::new(
+        if let Some(mut btn) = MulleButton::new(
             "Tür → Werkstatt", &f, door_def, Some(door_hov),
             320, 240, Some(Scene::Garage), 5, assets
         ) {
+            btn.sound_default = Some("02e015v0".into());
+            btn.sound_hover = Some("02e016v0".into());
+            // DropTarget: drag parts onto door → shop_floor
+            self.drag_drop.drop_targets.push(crate::game::drag_drop::DropTarget {
+                x: btn.x, y: btn.y, width: btn.width, height: btn.height,
+                id: "door_shop".into(), name: "Tür → Werkstatt".into(),
+            });
             self.buttons.push(btn);
+        }
+
+        // Debug: log what members exist at the expected numbers
+        if let Some(df) = assets.files.get(&f) {
+            tracing::debug!("  02.DXR has {} total cast members", df.cast_members.len());
+            for &num in &[door_def, door_hov, right_def, right_hov, left_def, left_hov] {
+                if let Some(m) = df.cast_members.get(&num) {
+                    let (w, h, rx, ry) = m.bitmap_info.as_ref()
+                        .map(|b| (b.width, b.height, b.reg_x, b.reg_y))
+                        .unwrap_or((0, 0, 0, 0));
+                    tracing::debug!("  Pile {} member #{}: name='{}' type={:?} size={}x{} reg=({},{})",
+                        pile, num, m.name, m.cast_type, w, h, rx, ry);
+                } else {
+                    tracing::warn!("  Pile {} member #{}: NOT FOUND in {}", pile, num, f);
+                }
+            }
+            // Dump arrow bitmap to file for inspection
+            if pile == 1 {
+                if let Some(bmp) = assets.decode_bitmap_transparent(&f, right_def) {
+                    let path = format!("debug_member_{}.raw", right_def);
+                    tracing::info!("Dumping member {} bitmap ({}x{}, {} pixels) to {}", right_def, bmp.width, bmp.height, bmp.pixels.len(), path);
+                    // Write as PPM for easy viewing
+                    let ppm_path = format!("debug_member_{}.ppm", right_def);
+                    let mut data = format!("P6\n{} {}\n255\n", bmp.width, bmp.height);
+                    let mut rgb_bytes = Vec::with_capacity(bmp.width as usize * bmp.height as usize * 3);
+                    for px in &bmp.pixels {
+                        rgb_bytes.push(((px >> 16) & 0xFF) as u8); // R
+                        rgb_bytes.push(((px >> 8) & 0xFF) as u8);  // G
+                        rgb_bytes.push((px & 0xFF) as u8);         // B
+                    }
+                    let _ = std::fs::write(&ppm_path, [data.as_bytes(), &rgb_bytes].concat());
+                    tracing::info!("Wrote {} (PPM image)", ppm_path);
+                }
+                // Also dump what the background lookup resolves to
+                let bg_name = bg_names[idx];
+                if let Some(bg_num) = self.find_member_by_name(&f, bg_name, assets) {
+                    tracing::info!("Background '{}' resolved to member #{}", bg_name, bg_num);
+                }
+            }
         }
 
         // Arrow right → next pile (target=None, handled specially in on_click)
         let right_pile = if pile >= 6 { 1 } else { pile + 1 };
-        if let Some(btn) = MulleButton::new(
+        if let Some(mut btn) = MulleButton::new(
             &format!("→ Haufen {}", right_pile), &f, right_def, Some(right_hov),
             320, 240, None, 5, assets
         ) {
+            // DropTarget: drag parts onto right arrow → next pile
+            self.drag_drop.drop_targets.push(crate::game::drag_drop::DropTarget {
+                x: btn.x, y: btn.y, width: btn.width, height: btn.height,
+                id: format!("arrow_right_{}", right_pile), name: format!("→ Haufen {}", right_pile),
+            });
             self.buttons.push(btn);
         }
 
         // Arrow left → prev pile
         let left_pile = if pile <= 1 { 6 } else { pile - 1 };
-        if let Some(btn) = MulleButton::new(
+        if let Some(mut btn) = MulleButton::new(
             &format!("← Haufen {}", left_pile), &f, left_def, Some(left_hov),
             320, 240, None, 5, assets
         ) {
+            // DropTarget: drag parts onto left arrow → prev pile
+            self.drag_drop.drop_targets.push(crate::game::drag_drop::DropTarget {
+                x: btn.x, y: btn.y, width: btn.width, height: btn.height,
+                id: format!("arrow_left_{}", left_pile), name: format!("← Haufen {}", left_pile),
+            });
             self.buttons.push(btn);
         }
     }
@@ -680,9 +763,11 @@ impl SceneHandler {
         self.load_bg(&f, 118, assets);
 
         // Mailbox: #42 default, #43 hover (no scene transition)
-        if let Some(btn) = MulleButton::new(
+        if let Some(mut btn) = MulleButton::new(
             "Briefkasten", &f, 42, Some(43), 320, 240, None, 5, assets
         ) {
+            btn.sound_default = Some("04e009v0".into());
+            btn.sound_hover = Some("04e010v0".into());
             self.buttons.push(btn);
         }
 
@@ -692,10 +777,17 @@ impl SceneHandler {
             self.load_overlay(&f, 13, 4, true, assets);  // side door static
 
             // Garage door → Garage
-            if let Some(btn) = MulleButton::new(
+            if let Some(mut btn) = MulleButton::new(
                 "Garagentor → Werkstatt", &f, 40, Some(41),
                 320, 240, Some(Scene::Garage), 6, assets
             ) {
+                btn.sound_default = Some("02e015v0".into());
+                btn.sound_hover = Some("02e016v0".into());
+                // DropTarget: drag parts onto garage door → shop_floor
+                self.drag_drop.drop_targets.push(crate::game::drag_drop::DropTarget {
+                    x: btn.x, y: btn.y, width: btn.width, height: btn.height,
+                    id: "door_shop".into(), name: "Garagentor → Werkstatt".into(),
+                });
                 self.buttons.push(btn);
             }
 
@@ -708,17 +800,31 @@ impl SceneHandler {
             });
         } else {
             // ── Door mode: both doors clickable → Garage, no road to World ──
-            if let Some(btn) = MulleButton::new(
+            if let Some(mut btn) = MulleButton::new(
                 "Seitentür → Werkstatt", &f, 13, Some(14),
                 320, 240, Some(Scene::Garage), 5, assets
             ) {
+                btn.sound_default = Some("02e015v0".into());
+                btn.sound_hover = Some("02e016v0".into());
+                // DropTarget: drag parts onto side door → shop_floor
+                self.drag_drop.drop_targets.push(crate::game::drag_drop::DropTarget {
+                    x: btn.x, y: btn.y, width: btn.width, height: btn.height,
+                    id: "door_shop".into(), name: "Seitentür → Werkstatt".into(),
+                });
                 self.buttons.push(btn);
             }
 
-            if let Some(btn) = MulleButton::new(
+            if let Some(mut btn) = MulleButton::new(
                 "Garagentor → Werkstatt", &f, 40, Some(41),
                 320, 240, Some(Scene::Garage), 6, assets
             ) {
+                btn.sound_default = Some("02e015v0".into());
+                btn.sound_hover = Some("02e016v0".into());
+                // DropTarget: drag parts onto garage door → shop_floor
+                self.drag_drop.drop_targets.push(crate::game::drag_drop::DropTarget {
+                    x: btn.x, y: btn.y, width: btn.width, height: btn.height,
+                    id: "door_shop".into(), name: "Garagentor → Werkstatt".into(),
+                });
                 self.buttons.push(btn);
             }
         }
@@ -1001,7 +1107,7 @@ impl SceneHandler {
 
     fn load_generic(&mut self, assets: &AssetStore) {
         let file = match self.scene {
-            Scene::CarWash => "06",
+            Scene::CarGallery => "06",
             Scene::Boot => "18",
             _ => return,
         };
@@ -1184,10 +1290,19 @@ impl SceneHandler {
 
     // ─── Mouse interaction ─────────────────────────────────────────────
 
-    pub fn on_mouse_move(&mut self, x: i32, y: i32) {
+    pub fn on_mouse_move(&mut self, x: i32, y: i32) -> Option<String> {
+        let mut hover_sound = None;
         for btn in &mut self.buttons {
+            let was_hovered = btn.hovered;
             btn.hovered = btn.hit_test(x, y);
+            // Trigger hover sound on entering button
+            if btn.hovered && !was_hovered {
+                if let Some(snd) = &btn.sound_hover {
+                    hover_sound = Some(snd.clone());
+                }
+            }
         }
+        hover_sound
     }
 
     /// Handle left click — buttons first, then sprites, then hotspots
@@ -1326,7 +1441,7 @@ impl SceneHandler {
             Key::F4 => Some(Scene::Yard),
             Key::F5 => Some(Scene::World),
             Key::F6 => Some(Scene::CarShow),
-            Key::F7 => Some(Scene::CarWash),
+            Key::F7 => Some(Scene::CarGallery),
             Key::F8 => Some(Scene::Destination(85)),
             Key::F9 => Some(Scene::Destination(92)),
             Key::Tab => {

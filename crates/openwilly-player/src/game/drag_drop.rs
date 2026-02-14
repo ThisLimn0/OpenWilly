@@ -325,6 +325,16 @@ impl DragDropState {
         self.items.remove(idx);
     }
 
+    /// Remove a draggable item by part_id. Returns true if found and removed.
+    pub fn remove_by_part_id(&mut self, part_id: u32) -> bool {
+        if let Some(idx) = self.items.iter().position(|i| i.part_id == part_id) {
+            self.remove_item(idx);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Collect current positions of all draggable items as part_id → (x, y)
     pub fn item_positions(&self) -> HashMap<u32, (i32, i32)> {
         self.items

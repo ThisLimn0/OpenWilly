@@ -26,9 +26,9 @@ pub enum PopupAction {
     Quit,
     /// Close the popup
     Cancel,
-    /// Placeholder (not implemented)
+    /// Toggle keyboard/mouse steering
     Steering,
-    /// Placeholder (not implemented)
+    /// Show earned medals / diploma info
     Diploma,
 }
 

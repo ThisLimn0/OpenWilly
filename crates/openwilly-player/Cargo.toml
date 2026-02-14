@@ -21,7 +21,6 @@ serde_json = "1.0"
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
 
 # Audio playback
 rodio = "0.19"

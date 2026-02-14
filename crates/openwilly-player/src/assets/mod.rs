@@ -142,12 +142,31 @@ impl AssetStore {
         transparent_color: Option<u8>,
     ) -> Option<bitmap::DecodedBitmap> {
         let df = self.files.get(file)?;
-        let member = df.cast_members.get(&num)?;
+        let member = match df.cast_members.get(&num) {
+            Some(m) => m,
+            None => {
+                tracing::trace!("decode_bitmap_inner: member {} not found in {}", num, file);
+                return None;
+            }
+        };
         if member.cast_type != director::CastType::Bitmap {
+            tracing::trace!("decode_bitmap_inner: member {} in {} has type {:?}, not Bitmap", num, file, member.cast_type);
             return None;
         }
-        let bitmap_info = member.bitmap_info.as_ref()?;
-        let bitd_data = member.linked_data.get("BITD")?;
+        let bitmap_info = match member.bitmap_info.as_ref() {
+            Some(bi) => bi,
+            None => {
+                tracing::warn!("decode_bitmap_inner: member {} '{}' in {} is Bitmap but has no bitmap_info", num, member.name, file);
+                return None;
+            }
+        };
+        let bitd_data = match member.linked_data.get("BITD") {
+            Some(d) => d,
+            None => {
+                tracing::warn!("decode_bitmap_inner: member {} '{}' in {} is Bitmap but has no BITD data (keys: {:?})", num, member.name, file, member.linked_data.keys().collect::<Vec<_>>());
+                return None;
+            }
+        };
 
         if bitmap_info.has_alpha() {
             tracing::trace!("Bitmap #{} has alpha channel (bit_alpha={})", num, bitmap_info.bit_alpha);
@@ -194,10 +213,13 @@ impl AssetStore {
 
     /// Find a sound cast member by name across all files.
     /// Returns (filename, member_num) if found.
+    /// Comparison is case-insensitive (Director names may be mixed case).
     pub fn find_sound_by_name(&self, name: &str) -> Option<(String, u32)> {
         for (fname, df) in &self.files {
             for (num, member) in &df.cast_members {
-                if member.cast_type == director::CastType::Sound && member.name == name {
+                if member.cast_type == director::CastType::Sound
+                    && member.name.eq_ignore_ascii_case(name)
+                {
                     return Some((fname.clone(), *num));
                 }
             }
@@ -207,10 +229,13 @@ impl AssetStore {
 
     /// Find cue points for a sound cast member by name.
     /// Returns the cue point list (empty if none found).
+    /// Comparison is case-insensitive.
     pub fn find_cue_points(&self, name: &str) -> Vec<director::CuePoint> {
         for (_fname, df) in &self.files {
             for (_num, member) in &df.cast_members {
-                if member.cast_type == director::CastType::Sound && member.name == name {
+                if member.cast_type == director::CastType::Sound
+                    && member.name.eq_ignore_ascii_case(name)
+                {
                     if let Some(si) = &member.sound_info {
                         return si.cue_points.clone();
                     }

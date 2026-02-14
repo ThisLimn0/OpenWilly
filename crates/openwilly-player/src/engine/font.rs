@@ -16,11 +16,20 @@ pub fn draw_text(fb: &mut [u32], x: i32, y: i32, text: &str, color: u32) {
 
 /// Draw a single character onto the framebuffer
 fn draw_char(fb: &mut [u32], x: i32, y: i32, ch: char, color: u32) {
-    let idx = ch as usize;
-    let glyph = if idx >= 32 && idx < 127 {
-        &FONT_DATA[(idx - 32) * 8..(idx - 32) * 8 + 8]
-    } else {
-        &FONT_DATA[63 * 8..63 * 8 + 8] // '?' for unknown
+    let glyph: &[u8] = match ch {
+        ' '..='~' => {
+            let idx = ch as usize - 32;
+            &FONT_DATA[idx * 8..idx * 8 + 8]
+        }
+        // German special characters → extra glyphs appended after ASCII
+        '\u{00E4}' => &FONT_EXTRA[0..8],   // ä
+        '\u{00F6}' => &FONT_EXTRA[8..16],  // ö
+        '\u{00FC}' => &FONT_EXTRA[16..24], // ü
+        '\u{00C4}' => &FONT_EXTRA[24..32], // Ä
+        '\u{00D6}' => &FONT_EXTRA[32..40], // Ö
+        '\u{00DC}' => &FONT_EXTRA[40..48], // Ü
+        '\u{00DF}' => &FONT_EXTRA[48..56], // ß
+        _ => &FONT_DATA[63 * 8..63 * 8 + 8], // '?' for unknown
     };
 
     for row in 0..8 {
@@ -52,7 +61,7 @@ pub fn draw_text_shadow(fb: &mut [u32], x: i32, y: i32, text: &str, color: u32) 
 
 /// Measure text width in pixels
 pub fn text_width(text: &str) -> i32 {
-    text.len() as i32 * 6
+    text.chars().count() as i32 * 6
 }
 
 /// Draw a filled rectangle
@@ -294,4 +303,26 @@ static FONT_DATA: &[u8] = &[
     0xC0, 0x20, 0x20, 0x18, 0x20, 0x20, 0xC0, 0x00,
     // 126: '~'
     0x00, 0x00, 0x40, 0xA8, 0x10, 0x00, 0x00, 0x00,
+];
+
+// ============================================================================
+// Extra glyphs for German characters: ä ö ü Ä Ö Ü ß
+// 6×8 pixel bitmaps, same format as FONT_DATA
+// ============================================================================
+#[rustfmt::skip]
+static FONT_EXTRA: &[u8] = &[
+    // ä (a with diaeresis)
+    0x50, 0x00, 0x70, 0x08, 0x78, 0x88, 0x78, 0x00,
+    // ö (o with diaeresis)
+    0x50, 0x00, 0x70, 0x88, 0x88, 0x88, 0x70, 0x00,
+    // ü (u with diaeresis)
+    0x50, 0x00, 0x88, 0x88, 0x88, 0x98, 0x68, 0x00,
+    // Ä (A with diaeresis)
+    0x50, 0x00, 0x70, 0x88, 0xF8, 0x88, 0x88, 0x00,
+    // Ö (O with diaeresis)
+    0x50, 0x00, 0x70, 0x88, 0x88, 0x88, 0x70, 0x00,
+    // Ü (U with diaeresis)
+    0x50, 0x00, 0x88, 0x88, 0x88, 0x88, 0x70, 0x00,
+    // ß (sharp s / Eszett)
+    0x70, 0x88, 0x90, 0xA0, 0x90, 0x88, 0xB0, 0x00,
 ];

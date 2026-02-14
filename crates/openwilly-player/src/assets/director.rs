@@ -420,19 +420,27 @@ impl DirectorFile {
         // Find CAS* chunks — they list the cast member slots
         // CAS* data is ALWAYS Big-Endian regardless of container endianness
         let mut cas_star_members: HashMap<usize, u32> = HashMap::new(); // slot -> member_num
+        let mut cas_star_count = 0u32;
         for i in 0..chunks.len() {
             if chunks[i].fourcc != "CAS*" || chunks[i].offset == 0 {
                 continue;
             }
+            cas_star_count += 1;
             reader.seek(SeekFrom::Start(chunks[i].offset as u64 + 8))?;
             let count = chunks[i].length / 4;
+            tracing::debug!("  CAS* #{} at chunk {}: {} entries", cas_star_count, i, count);
             for j in 0..count {
                 let slot = reader.read_u32_be()? as usize; // Always BE
                 let member_num = j + 1;
                 if slot > 0 && slot < chunks.len() {
-                    cas_star_members.insert(slot, member_num);
+                    if let Some(old) = cas_star_members.insert(slot, member_num) {
+                        tracing::warn!("  CAS* collision: slot {} was member {} now member {}", slot, old, member_num);
+                    }
                 }
             }
+        }
+        if cas_star_count > 1 {
+            tracing::warn!("  {} CAS* chunks found — member numbering may be incorrect!", cas_star_count);
         }
 
         // Parse each CASt chunk
@@ -695,5 +703,114 @@ impl DirectorFile {
             text_content,
             linked_data,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Diagnose cursor members 109-117 in 00.CXT
+    ///
+    /// Prints width, height, bit_depth, bit_alpha, palette_ref,
+    /// registration point, and BITD data size for each member.
+    #[test]
+    fn diagnose_cursor_members_109_117() {
+        // Try multiple paths to find 00.CXT
+        let candidates = [
+            "game/Movies/00.CXT",
+            "../game/Movies/00.CXT",
+            "../../game/Movies/00.CXT",
+        ];
+        let path = candidates.iter()
+            .map(Path::new)
+            .find(|p| p.exists());
+        let path = match path {
+            Some(p) => p,
+            None => {
+                // Try absolute path as last resort
+                let abs = Path::new(r"D:\Projekte\OpenWilly\game\Movies\00.CXT");
+                if abs.exists() {
+                    abs
+                } else {
+                    eprintln!("SKIP: 00.CXT not found in any candidate path");
+                    return;
+                }
+            }
+        };
+
+        let df = DirectorFile::parse(path).expect("Failed to parse 00.CXT");
+        eprintln!("=== 00.CXT: {} ===", df.info_line());
+        eprintln!();
+
+        // Also scan for any members with cursor-like names
+        let cursor_names = ["C_standard", "C_Grab", "C_Left", "C_Click",
+                            "C_Back", "C_Right", "C_MoveLeft", "C_MoveRight", "C_MoveIn"];
+
+        eprintln!("--- Members 109-117 ---");
+        for num in 109..=117 {
+            match df.cast_members.get(&num) {
+                Some(member) => {
+                    eprintln!("  Member {}: name='{}' type={:?}", num, member.name, member.cast_type);
+                    if let Some(bi) = &member.bitmap_info {
+                        eprintln!("    width={} height={} bit_depth={} bit_alpha={}",
+                            bi.width, bi.height, bi.bit_depth, bi.bit_alpha);
+                        eprintln!("    reg=({},{}) pos=({},{}) palette_ref={}",
+                            bi.reg_x, bi.reg_y, bi.pos_x, bi.pos_y, bi.palette_ref);
+                        if bi.bit_depth == 1 {
+                            eprintln!("    *** WARNING: 1-bit depth — may cause decode issues for small cursors ***");
+                        }
+                    } else {
+                        eprintln!("    (no bitmap_info)");
+                    }
+                    if let Some(bitd) = member.linked_data.get("BITD") {
+                        eprintln!("    BITD data: {} bytes", bitd.len());
+                        // Show first 32 bytes hex
+                        let preview: Vec<String> = bitd.iter().take(32).map(|b| format!("{:02x}", b)).collect();
+                        eprintln!("    BITD hex: {}", preview.join(" "));
+                    } else {
+                        eprintln!("    (no BITD data)  linked_keys={:?}", member.linked_data.keys().collect::<Vec<_>>());
+                    }
+                    eprintln!();
+                }
+                None => {
+                    eprintln!("  Member {}: NOT FOUND", num);
+                    eprintln!();
+                }
+            }
+        }
+
+        // Also search by cursor names
+        eprintln!("--- Name-based cursor search ---");
+        for name in &cursor_names {
+            let found: Vec<_> = df.cast_members.iter()
+                .filter(|(_, m)| m.name.eq_ignore_ascii_case(name))
+                .collect();
+            if found.is_empty() {
+                eprintln!("  '{}': NOT FOUND", name);
+            } else {
+                for (&num, member) in &found {
+                    eprintln!("  '{}' → member {} type={:?}", name, num, member.cast_type);
+                    if let Some(bi) = &member.bitmap_info {
+                        eprintln!("    width={} height={} bit_depth={} bit_alpha={} palette_ref={}",
+                            bi.width, bi.height, bi.bit_depth, bi.bit_alpha, bi.palette_ref);
+                    }
+                }
+            }
+        }
+
+        // Summary: list ALL bitmap members in range 100-130 for context
+        eprintln!();
+        eprintln!("--- All bitmap members 100-130 ---");
+        for num in 100..=130 {
+            if let Some(m) = df.cast_members.get(&num) {
+                if m.cast_type == CastType::Bitmap {
+                    let bi = m.bitmap_info.as_ref().unwrap();
+                    eprintln!("  #{}: '{}' {}×{} depth={} alpha={} pal={}",
+                        num, m.name, bi.width, bi.height, bi.bit_depth, bi.bit_alpha, bi.palette_ref);
+                }
+            }
+        }
     }
 }

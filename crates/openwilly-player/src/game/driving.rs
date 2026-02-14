@@ -66,6 +66,21 @@ pub const FERRY_DROP_DIRECTIONS: [u8; 2] = [14, 7];
 /// Ferry boarding sound
 pub const FERRY_SOUND: &str = "05e020v0";
 
+/// Racing start sound (from objects.hash.json Sounds[0])
+pub const RACING_START_SOUND: &str = "31e007v0";
+/// Racing finish sound (from objects.hash.json Sounds[1])
+pub const RACING_FINISH_SOUND: &str = "31e008v0";
+/// Racing scoreboard sprite (from CDDATA.CXT)
+#[allow(dead_code)]
+pub const RACING_BOARD_SPRITE: &str = "31b045v0";
+
+/// WBridge creaking sound (from objects.hash.json Sounds[0])
+pub const WBRIDGE_CREAK_SOUND: &str = "31e003v0";
+/// WBridge "too weak" speech (from objects.hash.json Sounds[1])
+pub const WBRIDGE_WARN_SOUND: &str = "31d010v0";
+/// CBridge sound (from objects.hash.json Sounds[0])
+pub const CBRIDGE_SOUND: &str = "31e004v0";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -103,10 +118,21 @@ pub struct MapObject {
     pub enabled: bool,
     /// CheckFor.Cache — strings to look for in CacheList (from objects.hash.json)
     pub check_for_cache: Vec<String>,
+    /// CheckFor.Medals — medal IDs to check (from objects.hash.json)
+    pub check_for_medals: Vec<u32>,
     /// IfFound action when CheckFor matches ("#NoDisplay", "#NoEnter", "#None")
     pub if_found: Option<String>,
     /// SetWhenDone — cache entries and part rewards on destination arrival
     pub set_when_done: Option<SetWhenDone>,
+    /// Sound ID for Sound trigger zones (from maps.hash.json per-tile opt)
+    pub sound_id: Option<String>,
+    /// Approach sound (Sounds[0] from objects.hash.json) — played on outer radius enter
+    pub approach_sound: Option<String>,
+    /// Sprite member name for the "normal" frame (from objects.hash.json FrameList)
+    /// "Dummy" entries are skipped (= None).
+    pub sprite_name: Option<String>,
+    /// If true, render under (behind) the car; if false, render over (in front).
+    pub z_under: bool,
 }
 
 /// Data applied when a destination is reached (SetWhenDone from objects.hash.json)
@@ -116,6 +142,8 @@ pub struct SetWhenDone {
     pub cache: Vec<String>,
     /// Part IDs to give (u32 for specific, 0 = #Random)
     pub parts: Vec<u32>,
+    /// Mission IDs to unlock (from objects.hash.json SetWhenDone.Missions)
+    pub missions: Vec<u32>,
 }
 
 /// Type of map object
@@ -142,8 +170,8 @@ pub enum MapObjectType {
     Goats,
     /// Ferry (boat transition)
     Ferry,
-    /// Racing event
-    Racing,
+    /// Racing event — enter_dir is the required approach direction (1-16)
+    Racing { enter_dir: u8 },
     /// Wooden bridge
     WBridge,
     /// Concrete bridge
@@ -156,6 +184,72 @@ pub enum MapObjectType {
     Sound,
 }
 
+/// Racing mini-game state (mulle.js Racing.js)
+#[derive(Debug, Clone)]
+pub struct RacingState {
+    /// Whether a race is currently in progress
+    pub is_racing: bool,
+    /// Frame at which the race started
+    pub race_start_frame: u64,
+    /// Number of times passed through from exit side (need 1 to finish)
+    pub nr_of_times_passed: i8,
+    /// Was the car inside the racing object's inner radius last frame?
+    pub in_zone: bool,
+    /// Entry direction classification: 1 = correct side, -1 = wrong side
+    pub entered_from: i8,
+    /// Global frame counter (incremented each update)
+    pub frame_count: u64,
+    /// Position of the racing object (for exit direction calculation)
+    pub obj_x: i32,
+    pub obj_y: i32,
+    /// Required entry direction (from maps.hash.json EnterDir)
+    pub enter_dir: u8,
+}
+
+impl RacingState {
+    pub fn new(enter_dir: u8) -> Self {
+        Self {
+            is_racing: false,
+            race_start_frame: 0,
+            nr_of_times_passed: 0,
+            in_zone: false,
+            entered_from: 0,
+            frame_count: 0,
+            obj_x: 0,
+            obj_y: 0,
+            enter_dir,
+        }
+    }
+}
+
+/// Calculate direction from point A to point B (1-16 compass, mulle.js calcDirection)
+pub fn calc_direction(from_x: f32, from_y: f32, to_x: f32, to_y: f32) -> u8 {
+    let diff_x = to_x - from_x;
+    let diff_y = from_y - to_y; // note: Y inverted
+    let mut diff_y_safe = diff_y;
+    if diff_y_safe == 0.0 { diff_y_safe = 0.1; }
+    let mut dir = (diff_x / diff_y_safe).atan();
+    if diff_x > 0.0 {
+        if diff_y_safe <= 0.0 {
+            dir += std::f32::consts::PI;
+        }
+    } else if diff_y_safe > 0.0 {
+        dir += 2.0 * std::f32::consts::PI;
+    } else {
+        dir += std::f32::consts::PI;
+    }
+    dir /= std::f32::consts::PI;
+    let mut result = (dir * 16.0 / 2.0).round() as u8;
+    if result == 0 { result = 16; }
+    result
+}
+
+/// Calculate the angular difference between two compass directions (0-8)
+pub fn direction_diff(a: u8, b: u8) -> u8 {
+    let diff = (a as i16 - b as i16).unsigned_abs() as u8;
+    if diff > 8 { 16 - diff } else { diff }
+}
+
 /// Hill size classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HillType {
@@ -164,19 +258,31 @@ pub enum HillType {
 }
 
 impl MapObject {
-    /// Check if this object should be disabled based on the car's CacheList.
+    /// Check if this object should be disabled based on the car's CacheList and medals.
     /// Implements mulle.js mapobject.js doCheck():
     ///   if CheckFor.Cache contains a value in CacheList AND IfFound=="#NoDisplay"
     ///   → disable the object (invisible + no collision)
-    pub fn do_check(&mut self, cache_list: &[String]) {
-        if self.check_for_cache.is_empty() { return; }
-
+    ///   if CheckFor.Medals contains a medal the player has → same.
+    pub fn do_check(&mut self, cache_list: &[String], medals: &[String]) {
+        // Check cache flags
         for cache_val in &self.check_for_cache {
             if cache_list.iter().any(|c| c == cache_val) {
                 if self.if_found.as_deref() == Some("#NoDisplay") {
                     self.enabled = false;
                     tracing::debug!("MapObject {} disabled by CheckFor {:?} (cache has {:?})",
                         self.object_id, self.check_for_cache, cache_val);
+                    return;
+                }
+            }
+        }
+        // Check medals
+        for &medal_id in &self.check_for_medals {
+            let medal_str = medal_id.to_string();
+            if medals.iter().any(|m| m == &medal_str) {
+                if self.if_found.as_deref() == Some("#NoDisplay") {
+                    self.enabled = false;
+                    tracing::debug!("MapObject {} disabled by CheckFor.Medals (has medal {})",
+                        self.object_id, medal_id);
                     return;
                 }
             }
@@ -255,8 +361,10 @@ impl WorldMap {
         let obj = |id: u32, x: i32, y: i32, t: MapObjectType, ir: f32, or: f32, dr: Option<&str>| {
             MapObject { object_id: id, x, y, obj_type: t, inner_radius: ir, outer_radius: or,
                         dir_resource: dr.map(|s| s.to_string()),
-                        enabled: true, check_for_cache: Vec::new(),
-                        if_found: None, set_when_done: None }
+                        enabled: true, check_for_cache: Vec::new(), check_for_medals: Vec::new(),
+                        if_found: None, set_when_done: None, sound_id: None,
+                        approach_sound: None,
+                        sprite_name: None, z_under: true }
         };
         let dest = |id: u32, x: i32, y: i32, ir: f32, or: f32, dr: &str| {
             obj(id, x, y, MapObjectType::Destination, ir, or, Some(dr))
@@ -456,13 +564,17 @@ impl WorldMap {
             dest(18, 565, 308, 25.0, 45.0, "87"),
         ]));
         // Tile 28 (appears 2× in grid)
-        tiles.insert(28, tile(28, vec![
-            obj(33, 468, 20, MapObjectType::Sound, 20.0, 0.0, None),
-            correct(468, 15, 205.0),
-            obj(7, 415, 60, MapObjectType::Racing, 25.0, 45.0, None),
-            gas(360, 266),
-            obj(29, 131, 266, MapObjectType::Picture, 0.0, 0.0, None),
-        ]));
+        {
+            let mut snd_obj = obj(33, 468, 20, MapObjectType::Sound, 20.0, 0.0, None);
+            snd_obj.sound_id = Some("31d007v0".to_string());
+            tiles.insert(28, tile(28, vec![
+                snd_obj,
+                correct(468, 15, 205.0),
+                obj(7, 415, 60, MapObjectType::Racing { enter_dir: 12 }, 25.0, 45.0, None),
+                gas(360, 266),
+                obj(29, 131, 266, MapObjectType::Picture, 0.0, 0.0, None),
+            ]));
+        }
         // Tile 30
         tiles.insert(30, tile(30, vec![
             correct(223, 12, 25.0),
@@ -492,6 +604,7 @@ impl WorldMap {
                         obj.set_when_done = Some(SetWhenDone {
                             cache: vec!["#TreeInRoad".into()],
                             parts: vec![0], // #Random
+                            missions: Vec::new(),
                         });
                     }
                     // Object 9: Dog (#rdest)
@@ -501,6 +614,7 @@ impl WorldMap {
                         obj.set_when_done = Some(SetWhenDone {
                             cache: vec!["#Dog".into(), "#GotDogOnce".into()],
                             parts: Vec::new(),
+                            missions: Vec::new(),
                         });
                     }
                     // Object 10: MudCar (#rdest)
@@ -510,6 +624,7 @@ impl WorldMap {
                         obj.set_when_done = Some(SetWhenDone {
                             cache: vec!["#MudCar".into(), "#RescuedMudCar".into()],
                             parts: vec![0], // #Random
+                            missions: Vec::new(),
                         });
                     }
                     // Object 19-24: RoadThing 1-6
@@ -521,15 +636,24 @@ impl WorldMap {
                         obj.set_when_done = Some(SetWhenDone {
                             cache: vec![tag],
                             parts: vec![0], // #Random (+ specific varies by object)
+                            missions: Vec::new(),
                         });
                     }
                     // Object 28: FarAway
                     28 => {
                         obj.check_for_cache = vec![];
+                        obj.check_for_medals = vec![2];
                         obj.if_found = Some("#NoDisplay".into());
-                        // mulle.js: CheckFor = {Medals: [2]}, only Cache is checked
                     }
-                    // Object 4: Exhibition
+                    // Object 2: Solhem (Mia) — dest 86
+                    2 => {
+                        obj.set_when_done = Some(SetWhenDone {
+                            cache: Vec::new(),
+                            parts: Vec::new(),
+                            missions: vec![5], // #Telephone mission
+                        });
+                    }
+                    // Object 4: Exhibition / CarShow — dest 94
                     4 => {
                         obj.check_for_cache = vec!["#Exhibition".into()];
                         // IfFound = #NoEnter (not #NoDisplay — object stays visible)
@@ -537,24 +661,59 @@ impl WorldMap {
                         obj.set_when_done = Some(SetWhenDone {
                             cache: vec!["#Exhibition".into()],
                             parts: Vec::new(),
+                            missions: vec![2], // #Mail mission
                         });
                     }
-                    // Object 14: Figge
-                    14 => {
-                        obj.check_for_cache = vec!["#Dog".into()];
-                        obj.if_found = Some("#None".into());
-                        obj.set_when_done = Some(SetWhenDone {
-                            cache: vec!["#ExtraTank".into()],
-                            parts: Vec::new(),
-                        });
-                    }
-                    // Object 5: Lemonade destination
+                    // Object 5: Lemonade destination — dest 88
                     5 => {
                         obj.check_for_cache = vec!["#Lemonade".into()];
                         obj.if_found = Some("#None".into());
                         obj.set_when_done = Some(SetWhenDone {
                             cache: vec![],
                             parts: vec![162],
+                            missions: vec![3], // #Mail mission
+                        });
+                    }
+                    // Object 7: Racing — Racing event
+                    7 => {
+                        obj.set_when_done = Some(SetWhenDone {
+                            cache: Vec::new(),
+                            parts: Vec::new(),
+                            missions: vec![8], // #Mail mission
+                        });
+                    }
+                    // Object 11: Luddelabb — dest 91
+                    11 => {
+                        obj.set_when_done = Some(SetWhenDone {
+                            cache: Vec::new(),
+                            parts: vec![99],
+                            missions: vec![6], // #Telephone mission
+                        });
+                    }
+                    // Object 12: Viola — dest 89
+                    12 => {
+                        obj.set_when_done = Some(SetWhenDone {
+                            cache: Vec::new(),
+                            parts: vec![172],
+                            missions: vec![7], // #Mail mission
+                        });
+                    }
+                    // Object 14: Figge — dest 92
+                    14 => {
+                        obj.check_for_cache = vec!["#Dog".into()];
+                        obj.if_found = Some("#None".into());
+                        obj.set_when_done = Some(SetWhenDone {
+                            cache: vec!["#ExtraTank".into()],
+                            parts: Vec::new(),
+                            missions: vec![1], // #Telephone mission
+                        });
+                    }
+                    // Object 17: DorisDigital — dest 90
+                    17 => {
+                        obj.set_when_done = Some(SetWhenDone {
+                            cache: Vec::new(),
+                            parts: vec![306],
+                            missions: vec![4], // #Telephone mission
                         });
                     }
                     // Object 18: Lemonade factory
@@ -562,9 +721,69 @@ impl WorldMap {
                         obj.set_when_done = Some(SetWhenDone {
                             cache: vec!["#Lemonade".into()],
                             parts: Vec::new(),
+                            missions: Vec::new(),
                         });
                     }
                     _ => {}
+                }
+
+                // --- Populate sprite_name from objects.hash.json FrameList ---
+                // Only set if the normal frame is not "Dummy" and not empty.
+                let sprite = match obj.object_id {
+                    // Cows (obj 1) — direction-less, use first variant
+                    1 => Some("31b003v0"),
+                    // Ferry (obj 3)
+                    3 => Some("31b015v0"),
+                    // Gas (obj 6) — "Bensinmack"
+                    6 => Some("Bensinmack"),
+                    // Racing board (obj 7)
+                    7 => Some("31b045v0"),
+                    // TreeInRoad (obj 8)
+                    8 => Some("31b011v0"),
+                    // Dog (obj 9)
+                    9 => Some("31b014v0"),
+                    // MudCar (obj 10) — variant 1
+                    10 => Some("31b009v0"),
+                    // RoadThing 19-24
+                    19..=24 => Some("31b044v0"),
+                    // Goats (obj 25)
+                    25 => Some("31b033v0"),
+                    // WBridge (obj 26) — variant 1
+                    26 => Some("31b020v0"),
+                    // CBridge (obj 27)
+                    27 => Some("31b030v0"),
+                    // Picture (obj 29)
+                    29 => Some("31b043v0"),
+                    // Stop signs (obj 32) — variant 1
+                    32 => Some("31b016v0"),
+                    _ => None,
+                };
+                if let Some(s) = sprite {
+                    obj.sprite_name = Some(s.to_string());
+                }
+                // z_under: most objects render behind car. Picture (29) renders over.
+                obj.z_under = obj.object_id != 29;
+
+                // --- Populate approach_sound from objects.hash.json Sounds[0] ---
+                let asound = match obj.object_id {
+                    1 => Some("31d001v0"),   // Cows
+                    2 => Some("31d017v0"),   // Solhem
+                    3 => Some("31d008v0"),   // Ferry
+                    6 => Some("31e006v0"),   // Gas
+                    7 => Some("31e007v0"),   // Racing
+                    8 => Some("31d005v0"),   // TreeInRoad
+                    9 => Some("31d006v0"),   // Dog
+                    10 => Some("31d004v0"),  // MudCar
+                    11 => Some("31d013v0"),  // Luddelabb
+                    12 => Some("31d012v0"),  // Viola
+                    14 => Some("31d014v0"),  // Figge
+                    16 => Some("31d016v0"),  // Stansen
+                    17 => Some("31d015v0"),  // DorisDigital
+                    25 => Some("31d001v0"),  // Goats (reuse cow sound)
+                    _ => None,
+                };
+                if let Some(s) = asound {
+                    obj.approach_sound = Some(s.to_string());
                 }
             }
         }
@@ -720,6 +939,12 @@ pub struct DriveCar {
     out_of_bounds: u32,
     /// Ferry step: toggles 0↔1 each crossing (mulle.js ferryStep)
     pub ferry_step: u8,
+    /// Racing mini-game state (persists across frames within a tile)
+    pub racing: Option<RacingState>,
+    /// Pending approach sounds to play (filled during update, drained by caller)
+    pub pending_approach_sounds: Vec<String>,
+    /// Set of object IDs whose outer radius we've already entered (for one-shot approach sounds)
+    entered_outer_set: std::collections::HashSet<u32>,
 }
 
 /// Result of a drive frame update
@@ -758,6 +983,26 @@ pub enum DriveEvent {
     },
     /// Ferry boarding — car teleports to other shore
     FerryBoard,
+    /// Race started — play start sound
+    RaceStarted,
+    /// Race finished — play finish sound + award medal
+    RaceFinished { time_secs: f32 },
+    /// Bridge sound effect
+    BridgeSound { wooden: bool },
+    /// FarAway landmark reached (medal trigger)
+    FarAwayReached { object_id: u32 },
+    /// Sound trigger zone entered
+    SoundTrigger { sound_id: String },
+    /// Approach sound — played when entering outer radius of a map object
+    ApproachSound { sound_id: String },
+}
+
+/// Dev cheat flags passed from the dev menu to the drive update loop
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DriveCheat {
+    pub infinite_fuel: bool,
+    pub noclip: bool,
+    pub meme_mode: bool,
 }
 
 impl DriveCar {
@@ -791,6 +1036,9 @@ impl DriveCar {
             out_of_bounds: 0,
             forward_backward: 0,
             ferry_step: 0,
+            racing: None,
+            pending_approach_sounds: Vec::new(),
+            entered_outer_set: std::collections::HashSet::new(),
         }
     }
 
@@ -823,11 +1071,11 @@ impl DriveCar {
     ///
     /// `topology` is a function that returns the terrain value (red channel)
     /// at a given topology coordinate. Pass None if topology not available.
-    pub fn update<F>(&mut self, objects: &[MapObject], get_terrain: F) -> DriveEvent
+    pub fn update<F>(&mut self, objects: &[MapObject], get_terrain: F, cheats: DriveCheat) -> DriveEvent
     where
         F: Fn(i32, i32) -> u8,
     {
-        if self.fuel_empty {
+        if self.fuel_empty && !cheats.infinite_fuel {
             return DriveEvent::FuelEmpty;
         }
 
@@ -874,11 +1122,13 @@ impl DriveCar {
         }
 
         // --- Acceleration / Braking ---
+        let max_speed = if cheats.meme_mode { self.props.max_speed * 30.0 } else { self.props.max_speed };
+        let accel = if cheats.meme_mode { self.props.acceleration * 5.0 } else { self.props.acceleration };
         if self.throttle {
             self.forward_backward = 1;
-            self.speed += self.props.acceleration;
-            if self.speed > self.props.max_speed {
-                self.speed = self.props.max_speed;
+            self.speed += accel;
+            if self.speed > max_speed {
+                self.speed = max_speed;
             }
         } else if self.braking {
             if self.speed > 0.0 {
@@ -934,6 +1184,7 @@ impl DriveCar {
         // --- mulle.js side-check / wall slide ---
         // Check left (dir-1) and right (dir+1) sides of the car.
         // If one side hits a wall, turn away and reduce speed by 0.9×.
+        if !cheats.noclip && !cheats.meme_mode {
         for d in 0..=1u8 {
             let dir_offset: i8 = if d == 0 { -1 } else { 1 };
             let check_dir = correct_direction((self.direction as i8 + dir_offset) as u8);
@@ -959,6 +1210,7 @@ impl DriveCar {
                 break;
             }
         }
+        } // noclip
 
         let (dx, dy) = direction_vector(self.direction);
         let new_x = self.x + dx * self.speed;
@@ -969,7 +1221,7 @@ impl DriveCar {
         let topo_y = ((new_y as i32 - MAP_OFFSET_Y) / 2).clamp(0, TOPO_HEIGHT - 1);
         let terrain = get_terrain(topo_x, topo_y);
 
-        if terrain >= TERRAIN_WALL {
+        if terrain >= TERRAIN_WALL && !cheats.noclip {
             // Frontal wall hit — stop and increment OutOfBounds counter
             self.speed = 0.0;
             self.out_of_bounds += 1;
@@ -980,21 +1232,23 @@ impl DriveCar {
         self.out_of_bounds = 0;
 
         let altitude = (terrain % 16) as i32;
-        if altitude > 2 && self.props.strength <= BIG_HILL_STRENGTH_THRESHOLD {
-            self.speed = 0.0;
-            return DriveEvent::TerrainBlocked { reason: "big_hill" };
-        }
-        if altitude > 1 && self.props.strength <= SMALL_HILL_STRENGTH_THRESHOLD {
-            self.speed = 0.0;
-            return DriveEvent::TerrainBlocked { reason: "small_hill" };
-        }
-        if terrain == TERRAIN_MUD && self.props.grip <= MUD_GRIP_THRESHOLD {
-            self.speed = 0.0;
-            return DriveEvent::TerrainBlocked { reason: "mud" };
-        }
-        if terrain == TERRAIN_HOLES && self.props.durability <= HOLES_DURABILITY_THRESHOLD {
-            self.speed = 0.0;
-            return DriveEvent::TerrainBlocked { reason: "holes" };
+        if !cheats.noclip {
+            if altitude > 2 && self.props.strength <= BIG_HILL_STRENGTH_THRESHOLD {
+                self.speed = 0.0;
+                return DriveEvent::TerrainBlocked { reason: "big_hill" };
+            }
+            if altitude > 1 && self.props.strength <= SMALL_HILL_STRENGTH_THRESHOLD {
+                self.speed = 0.0;
+                return DriveEvent::TerrainBlocked { reason: "small_hill" };
+            }
+            if terrain == TERRAIN_MUD && self.props.grip <= MUD_GRIP_THRESHOLD {
+                self.speed = 0.0;
+                return DriveEvent::TerrainBlocked { reason: "mud" };
+            }
+            if terrain == TERRAIN_HOLES && self.props.durability <= HOLES_DURABILITY_THRESHOLD {
+                self.speed = 0.0;
+                return DriveEvent::TerrainBlocked { reason: "holes" };
+            }
         }
 
         // Update tilt from altitude
@@ -1005,7 +1259,7 @@ impl DriveCar {
         self.y = new_y;
 
         // --- Fuel consumption ---
-        if self.speed.abs() > 0.001 {
+        if self.speed.abs() > 0.001 && !cheats.infinite_fuel {
             self.fuel -= self.speed.abs() * self.props.fuel_consumption / 100.0;
             if self.fuel <= 0.0 {
                 self.fuel = 0.0;
@@ -1033,6 +1287,8 @@ impl DriveCar {
         }
 
         // --- Object collision detection ---
+        let mut racing_zone_hit = false;
+        let mut pending_event: Option<DriveEvent> = None;
         for obj in objects {
             // Skip disabled objects (hidden by CheckFor/IfFound="#NoDisplay")
             if !obj.enabled { continue; }
@@ -1090,25 +1346,127 @@ impl DriveCar {
                         self.speed = 0.0;
                         return DriveEvent::FerryBoard;
                     }
-                    MapObjectType::Racing => {
-                        tracing::trace!("Racing at ({}, {})", obj.x, obj.y);
+                    MapObjectType::Racing { enter_dir } => {
+                        racing_zone_hit = true;
+                        if let Some(racing) = &mut self.racing {
+                            if !racing.in_zone {
+                                // Just entered the inner zone — handle enter event
+                                racing.in_zone = true;
+                                racing.obj_x = obj.x;
+                                racing.obj_y = obj.y;
+                                let car_dir = calc_direction(self.x, self.y, obj.x as f32, obj.y as f32);
+                                let diff = direction_diff(*enter_dir, car_dir);
+                                if diff <= 3 {
+                                    // Entered from correct direction
+                                    racing.entered_from = 1;
+                                    if racing.is_racing {
+                                        if racing.nr_of_times_passed >= 1 {
+                                            // Finish race!
+                                            let elapsed = racing.frame_count - racing.race_start_frame;
+                                            let time_secs = elapsed as f32 / DRIVE_FPS as f32;
+                                            racing.is_racing = false;
+                                            tracing::info!("Race finished in {:.2}s", time_secs);
+                                            pending_event = Some(DriveEvent::RaceFinished { time_secs });
+                                        }
+                                    } else {
+                                        // Start race!
+                                        racing.is_racing = true;
+                                        racing.nr_of_times_passed = 0;
+                                        racing.race_start_frame = racing.frame_count;
+                                        tracing::info!("Race started!");
+                                        pending_event = Some(DriveEvent::RaceStarted);
+                                    }
+                                } else {
+                                    racing.entered_from = -1;
+                                }
+                            }
+                            // else: still in zone, do nothing
+                        }
                     }
-                    MapObjectType::WBridge | MapObjectType::CBridge => {
-                        tracing::trace!("Bridge at ({}, {})", obj.x, obj.y);
+                    MapObjectType::WBridge => {
+                        return DriveEvent::BridgeSound { wooden: true };
                     }
-                    MapObjectType::Custom | MapObjectType::FarAway |
-                    MapObjectType::Picture | MapObjectType::Sound => {
+                    MapObjectType::CBridge => {
+                        return DriveEvent::BridgeSound { wooden: false };
+                    }
+                    MapObjectType::FarAway => {
+                        return DriveEvent::FarAwayReached { object_id: obj.object_id };
+                    }
+                    MapObjectType::Sound => {
+                        if let Some(ref sid) = obj.sound_id {
+                            return DriveEvent::SoundTrigger { sound_id: sid.clone() };
+                        }
+                    }
+                    MapObjectType::Custom | MapObjectType::Picture => {
                         tracing::trace!("Object {} at ({}, {})", obj.object_id, obj.x, obj.y);
                     }
                 }
-            } else if dist <= obj.outer_radius / 2.0 {
-                // Approaching object — can be used for visual/audio cues
-                // mulle.js halves BOTH inner and outer radius
-                tracing::trace!("Approaching object {} (dist={:.1})", obj.object_id, dist);
+            } else if dist <= obj.outer_radius {
+                // Entering outer radius — play approach sound if not yet played
+                if !self.entered_outer_set.contains(&obj.object_id) {
+                    self.entered_outer_set.insert(obj.object_id);
+                    if let Some(ref asnd) = obj.approach_sound {
+                        self.pending_approach_sounds.push(asnd.clone());
+                    }
+                }
+            } else {
+                // Outside outer radius — reset tracking
+                self.entered_outer_set.remove(&obj.object_id);
             }
         }
 
-        DriveEvent::None
+        // --- Racing zone exit detection ---
+        if let Some(racing) = &mut self.racing {
+            racing.frame_count += 1;
+            if racing.in_zone && !racing_zone_hit {
+                // Car has left the racing inner zone
+                racing.in_zone = false;
+                if racing.is_racing {
+                    // Calculate exit direction to determine pass count
+                    let exit_dir = calc_direction(self.x, self.y, racing.obj_x as f32, racing.obj_y as f32);
+                    let diff = direction_diff(racing.enter_dir, exit_dir);
+                    if diff <= 3 {
+                        // Exiting from same side as entry
+                        if racing.entered_from == -1 {
+                            racing.nr_of_times_passed -= 1;
+                            tracing::debug!("Racing: passed minus → {}", racing.nr_of_times_passed);
+                        }
+                    } else {
+                        // Exiting from opposite side
+                        if racing.entered_from == 1 {
+                            racing.nr_of_times_passed += 1;
+                            tracing::debug!("Racing: passed plus → {}", racing.nr_of_times_passed);
+                        }
+                    }
+                }
+            }
+        }
+
+        pending_event.unwrap_or(DriveEvent::None)
+    }
+
+    /// Initialize racing state from tile objects (call when entering a new tile).
+    /// Preserves existing race-in-progress if the enter_dir matches.
+    pub fn init_racing_for_tile(&mut self, objects: &[MapObject]) {
+        let racing_obj = objects.iter().find(|o| matches!(o.obj_type, MapObjectType::Racing { .. }));
+        match racing_obj {
+            Some(obj) => {
+                if let MapObjectType::Racing { enter_dir } = obj.obj_type {
+                    let preserve = self.racing.as_ref().map_or(false, |r| r.enter_dir == enter_dir);
+                    if !preserve {
+                        self.racing = Some(RacingState::new(enter_dir));
+                        tracing::debug!("Racing state initialized: enter_dir={}", enter_dir);
+                    }
+                }
+            }
+            None => {
+                // No racing on this tile — clear state (but keep race timer running
+                // so cross-tile races can work if the same tile appears twice in the grid)
+                if let Some(racing) = &mut self.racing {
+                    racing.in_zone = false;
+                }
+            }
+        }
     }
 
     /// Handle tile transition (wrap coordinates)
@@ -1403,7 +1761,7 @@ mod tests {
     fn acceleration_increases_speed() {
         let mut car = DriveCar::new(320.0, 200.0, 1, test_props());
         car.throttle = true;
-        car.update(&[], |_, _| 0);
+        car.update(&[], |_, _| 0, DriveCheat::default());
         assert!(car.speed > 0.0);
     }
 
@@ -1411,7 +1769,7 @@ mod tests {
     fn wall_stops_car() {
         let mut car = DriveCar::new(320.0, 200.0, 1, test_props());
         car.speed = 2.0;
-        let event = car.update(&[], |_, _| 250); // everything is wall
+        let event = car.update(&[], |_, _| 250, DriveCheat::default()); // everything is wall
         matches!(event, DriveEvent::TerrainBlocked { reason: "wall" });
     }
 
@@ -1420,7 +1778,7 @@ mod tests {
         let mut car = DriveCar::new(320.0, 200.0, 1, test_props());
         let initial_fuel = car.fuel;
         car.speed = 2.0;
-        car.update(&[], |_, _| 0);
+        car.update(&[], |_, _| 0, DriveCheat::default());
         assert!(car.fuel < initial_fuel, "Fuel should decrease while moving");
     }
 
@@ -1465,7 +1823,7 @@ mod tests {
         let mut car = DriveCar::new(320.0, 200.0, 1, test_props());
         car.fuel = 0.01;
         car.speed = 2.0;
-        let event = car.update(&[], |_, _| 0);
+        let event = car.update(&[], |_, _| 0, DriveCheat::default());
         assert!(car.fuel_empty || matches!(event, DriveEvent::FuelEmpty));
     }
 
@@ -1541,9 +1899,11 @@ mod tests {
             object_id: 6, x: 120, y: 350,
             obj_type: MapObjectType::Gas, inner_radius: 15.0, outer_radius: 25.0,
             dir_resource: None, enabled: true,
-            check_for_cache: Vec::new(), if_found: None, set_when_done: None,
+            check_for_cache: Vec::new(), check_for_medals: Vec::new(),
+            if_found: None, set_when_done: None,
+            sound_id: None, approach_sound: None, sprite_name: None, z_under: true,
         };
-        let event = car.update(&[gas], |_, _| 0);
+        let event = car.update(&[gas], |_, _| 0, DriveCheat::default());
         assert!(matches!(event, DriveEvent::GasStation));
         assert_eq!(car.refuel_ticks, 10);
         assert_eq!(car.speed, 0.0);
@@ -1555,7 +1915,7 @@ mod tests {
         car.fuel = 0.0;
         car.refuel_ticks = 1; // last step
         car.refuel_frame_counter = 9; // about to tick
-        let event = car.update(&[], |_, _| 0);
+        let event = car.update(&[], |_, _| 0, DriveCheat::default());
         assert!(matches!(event, DriveEvent::None));
         assert!(car.fuel > 0.0, "fuel should increase");
         assert_eq!(car.refuel_ticks, 0, "refueling should be done");
@@ -1571,9 +1931,11 @@ mod tests {
             object_id: 1, x: 370, y: 340,
             obj_type: MapObjectType::Cows, inner_radius: 55.0, outer_radius: 85.0,
             dir_resource: None, enabled: true,
-            check_for_cache: Vec::new(), if_found: None, set_when_done: None,
+            check_for_cache: Vec::new(), check_for_medals: Vec::new(),
+            if_found: None, set_when_done: None,
+            sound_id: None, approach_sound: None, sprite_name: None, z_under: true,
         };
-        let event = car.update(&[cows], |_, _| 0);
+        let event = car.update(&[cows], |_, _| 0, DriveCheat::default());
         assert!(matches!(event, DriveEvent::AnimalsBlocking { has_horn: false, horn_type: 0 }));
         assert_eq!(car.speed, 0.0);
     }

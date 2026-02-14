@@ -117,6 +117,19 @@ impl JunkSave {
         }
     }
 
+    /// Remove a part from ALL locations (piles, shop_floor, yard).
+    /// Call this before inserting into a new location to prevent duplication.
+    pub fn remove_part_everywhere(&mut self, part_id: u32) {
+        self.pile1.remove(&part_id);
+        self.pile2.remove(&part_id);
+        self.pile3.remove(&part_id);
+        self.pile4.remove(&part_id);
+        self.pile5.remove(&part_id);
+        self.pile6.remove(&part_id);
+        self.shop_floor.remove(&part_id);
+        self.yard.remove(&part_id);
+    }
+
     /// Initialize default junk piles (from mulle.js savedata.js setDefaults)
     ///
     /// Each pile has specific part IDs with individual x,y positions.
@@ -242,7 +255,9 @@ impl SaveManager {
         match serde_json::to_string_pretty(&self.users_db) {
             Ok(json) => {
                 if let Some(parent) = self.save_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        tracing::warn!("Failed to create save directory {}: {}", parent.display(), e);
+                    }
                 }
                 match std::fs::write(&self.save_path, &json) {
                     Ok(_) => tracing::debug!("Saved to {}", self.save_path.display()),
@@ -356,6 +371,41 @@ impl SaveManager {
         self.save();
     }
 
+    /// Give a mission (add to given_missions if not already given or completed)
+    pub fn give_mission(&mut self, mission_id: u32) {
+        let mid = mission_id.to_string();
+        if let Some(user) = self.active_mut() {
+            if !user.given_missions.contains(&mid) && !user.completed_missions.contains(&mid) {
+                user.given_missions.push(mid.clone());
+                tracing::info!("Mission {} added to given_missions", mid);
+            }
+        }
+        self.save();
+    }
+
+    /// Check if there are pending (given but not completed) missions
+    pub fn has_pending_missions(&self) -> bool {
+        self.active().map(|u| !u.given_missions.is_empty()).unwrap_or(false)
+    }
+
+    /// Get a pending mission ID and remove it from given_missions
+    pub fn pop_pending_mission(&mut self) -> Option<u32> {
+        let mid = self.active_mut().and_then(|u| {
+            if u.given_missions.is_empty() { None }
+            else { Some(u.given_missions.remove(0)) }
+        });
+        if let Some(ref m) = mid {
+            // Move to completed
+            if let Some(user) = self.active_mut() {
+                if !user.completed_missions.contains(m) {
+                    user.completed_missions.push(m.clone());
+                }
+            }
+            self.save();
+        }
+        mid.and_then(|s| s.parse().ok())
+    }
+
     /// Add an owned item / story flag
     pub fn add_stuff(&mut self, item: &str) {
         if let Some(user) = self.active_mut() {
@@ -409,6 +459,7 @@ impl SaveManager {
     /// Used by SetWhenDone #Random rewards (mulle.js savedata.js getRandomPart).
     pub fn random_unowned_part(&self) -> Option<u32> {
         use crate::game::parts_db::PartsDB;
+        use rand::seq::SliceRandom;
 
         let user = self.active()?;
 
@@ -429,10 +480,13 @@ impl SaveManager {
             owned.insert(id);
         }
 
-        // Pick first random part not owned (deterministic fallback)
-        PartsDB::random_part_ids().iter()
-            .find(|&&id| !owned.contains(&id))
+        // Collect all unowned random parts, then pick one at random
+        let available: Vec<u32> = PartsDB::random_part_ids().iter()
+            .filter(|&&id| !owned.contains(&id))
             .copied()
+            .collect();
+        let mut rng = rand::thread_rng();
+        available.choose(&mut rng).copied()
     }
 }
 

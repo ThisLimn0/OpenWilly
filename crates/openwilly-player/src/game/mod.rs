@@ -6,7 +6,7 @@
 //!   03.DXR — Werkstatt (Garage) — build car
 //!   04.CXT — Hof (Yard) — Mulle's front yard
 //!   05.DXR — Weltkarte (World map) — drive around
-//!   06.DXR — Autowäsche (Car wash)
+//!   06.DXR — Autogalerie (Saved Car Gallery)
 //!   08.CXT — Autoshow (Car show) — rate your car
 //!   10.DXR — Hauptmenü (Main menu)
 //!   12.DXR — Intro movie
@@ -52,7 +52,7 @@ pub enum Scene {
     Junkyard,
     Yard,
     World,
-    CarWash,
+    CarGallery,
     CarShow,
     Destination(u8), // 82-94
 }
@@ -67,7 +67,7 @@ impl Scene {
             Scene::Junkyard => "02.CXT",
             Scene::Yard => "04.CXT",
             Scene::World => "05.DXR",
-            Scene::CarWash => "06.DXR",
+            Scene::CarGallery => "06.DXR",
             Scene::CarShow => "08.CXT",
             Scene::Destination(n) => {
                 // Will be handled dynamically
@@ -84,18 +84,26 @@ impl Scene {
     }
 }
 
+/// Cutscene lookup: either a named member or a numeric member in 00.CXT
+enum CutsceneMember {
+    /// Named member (e.g. "00b011v0") — looked up by name
+    Named(&'static str),
+    /// Numeric member (e.g. 67) — used directly with 00.CXT member number
+    Number(u32),
+}
+
 /// Get the 00.CXT cutscene member for a specific scene transition.
-/// Returns the member name (string-based lookup) or number, as a string.
-fn transition_cutscene(from: &Scene, to: &Scene, has_car: bool) -> Option<&'static str> {
+fn transition_cutscene(from: &Scene, to: &Scene, has_car: bool) -> Option<CutsceneMember> {
     match (from, to) {
-        (Scene::Menu, Scene::Garage)    => Some("00b011v0"),
-        (Scene::Yard, Scene::Garage) if !has_car => Some("00b011v0"), // side door / no car
-        (Scene::Yard, Scene::Garage) if has_car  => Some("00b015v0"), // garage door, car
-        (Scene::Yard, Scene::World)     => Some("00b008v0"),
-        (Scene::World, _)              => Some("00b008v0"), // destinations
-        (Scene::Garage, Scene::Junkyard) => None, // member 70 (numeric) — skip for now
-        (Scene::Junkyard, Scene::Garage) => None, // member 71 — skip for now
-        (Scene::Garage, Scene::Yard)    => None,  // member 67/68 — skip for now
+        (Scene::Menu, Scene::Garage)    => Some(CutsceneMember::Named("00b011v0")),
+        (Scene::Yard, Scene::Garage) if !has_car => Some(CutsceneMember::Named("00b011v0")),
+        (Scene::Yard, Scene::Garage) if has_car  => Some(CutsceneMember::Named("00b015v0")),
+        (Scene::Yard, Scene::World)     => Some(CutsceneMember::Named("00b008v0")),
+        (Scene::World, _)              => Some(CutsceneMember::Named("00b008v0")),
+        (Scene::Garage, Scene::Junkyard) => Some(CutsceneMember::Number(70)),
+        (Scene::Junkyard, Scene::Garage) => Some(CutsceneMember::Number(71)),
+        (Scene::Garage, Scene::Yard) if has_car  => Some(CutsceneMember::Number(67)),
+        (Scene::Garage, Scene::Yard) if !has_car => Some(CutsceneMember::Number(68)),
         _ => None,
     }
 }
@@ -279,27 +287,40 @@ impl GameState {
             // Clone needed world map data upfront to avoid borrow conflicts
             // (world_map ref can't be live during &mut self calls like load_topology)
             let cache_list: Vec<String> = self.quest.cache_list().to_vec();
-            let all_swd: Vec<(u32, driving::SetWhenDone)> = self.world_map.as_ref().unwrap()
+            let medals: Vec<String> = self.save_manager.active()
+                .map(|u| u.car.medals.clone())
+                .unwrap_or_default();
+            let all_swd: Vec<(u32, driving::SetWhenDone)> = self.world_map.as_ref()
+                .expect("world_map must be initialised for driving scene")
                 .tiles.values().flat_map(|t| &t.objects)
                 .filter_map(|o| o.set_when_done.as_ref().map(|s| (o.object_id, s.clone())))
                 .collect();
             // Collect results from car update within inner scope to release borrow
             let (drive_event, engine_sound, saved_session, new_tile_pos) = if let Some(car) = &mut self.drive_car {
-                let wm = self.world_map.as_ref().unwrap();
+                let wm = self.world_map.as_ref()
+                    .expect("world_map must be initialised for driving scene");
                 let mut tile_objects: Vec<driving::MapObject> = wm.tile_at(car.tile_col, car.tile_row)
                     .and_then(|tid| wm.get_tile(tid))
                     .map(|t| t.objects.clone())
                     .unwrap_or_default();
 
-                // Apply CheckFor/IfFound — disable objects whose cache flag is already set
+                // Apply CheckFor/IfFound — disable objects whose cache flag or medal is set
                 for obj in &mut tile_objects {
-                    obj.do_check(&cache_list);
+                    obj.do_check(&cache_list, &medals);
                 }
 
+                // Initialize racing state when tile has a Racing object
+                car.init_racing_for_tile(&tile_objects);
+
+                let drive_cheats = driving::DriveCheat {
+                    infinite_fuel: self.dev_menu.infinite_fuel,
+                    noclip: self.dev_menu.noclip,
+                    meme_mode: self.dev_menu.meme_mode,
+                };
                 let event = car.update(&tile_objects, |tx, ty| {
                     let idx = ty as usize * topo_w + tx as usize;
                     if idx < topo.len() { topo[idx] } else { 0 }
-                });
+                }, drive_cheats);
                 let saved = match &event {
                     driving::DriveEvent::ReachedDestination { .. } => Some(car.save_session()),
                     _ => None,
@@ -318,12 +339,23 @@ impl GameState {
 
             // Load new topology after tile transition (outside car borrow)
             if let Some((col, row)) = new_tile_pos {
-                let topo_name = self.world_map.as_ref().unwrap()
-                    .tile_at(col, row)
-                    .and_then(|tid| self.world_map.as_ref().unwrap().get_tile(tid))
+                let wm = self.world_map.as_ref()
+                    .expect("world_map must be initialised for driving scene");
+                let topo_name = wm.tile_at(col, row)
+                    .and_then(|tid| wm.get_tile(tid))
                     .map(|t| t.topology.clone());
                 if let Some(topo_name) = topo_name {
                     self.load_topology(&topo_name);
+                }
+            }
+
+            // Play approach sounds from map objects (outside car borrow)
+            if let Some(car) = &mut self.drive_car {
+                let approach_sounds: Vec<String> = car.pending_approach_sounds.drain(..).collect();
+                for sid in approach_sounds {
+                    if let Some(snd) = &mut self.sound {
+                        snd.play_by_name(&sid, &self.assets);
+                    }
                 }
             }
 
@@ -339,7 +371,7 @@ impl GameState {
                             self.drive_session = session;
                         }
 
-                        // Apply SetWhenDone: add cache flags + give parts
+                        // Apply SetWhenDone: add cache flags + give parts + unlock missions
                         // (from mulle.js roadthing.js + mapobject.js)
                         let swd = all_swd.iter()
                             .find(|(oid, _)| *oid == object_id)
@@ -359,6 +391,10 @@ impl GameState {
                                 };
                                 self.save_manager.add_yard_part(actual_id);
                                 tracing::info!("SetWhenDone: gave part {} to yard", actual_id);
+                            }
+                            for &mid in &swd.missions {
+                                self.save_manager.give_mission(mid);
+                                tracing::info!("SetWhenDone: unlocked mission {}", mid);
                             }
                         }
 
@@ -396,6 +432,9 @@ impl GameState {
                         if let Some(snd) = &mut self.sound {
                             snd.play_by_name(sound, &self.assets);
                         }
+                        if big {
+                            self.award_medal(1); // BigHill medal
+                        }
                     }
                     driving::DriveEvent::FerryBoard => {
                         // Ferry crossing — requires #FerryTicket (from Mia/Solhem dest 86)
@@ -411,6 +450,38 @@ impl GameState {
                         } else {
                             // No ticket — Mulle says he needs a ticket
                             self.play_dialog("05d014v0"); // "Ich brauche ein Fährticket"
+                        }
+                    }
+                    driving::DriveEvent::RaceStarted => {
+                        if let Some(snd) = &mut self.sound {
+                            snd.play_by_name(driving::RACING_START_SOUND, &self.assets);
+                        }
+                        tracing::info!("Race started!");
+                    }
+                    driving::DriveEvent::RaceFinished { time_secs } => {
+                        if let Some(snd) = &mut self.sound {
+                            snd.play_by_name(driving::RACING_FINISH_SOUND, &self.assets);
+                        }
+                        // Award racing medal
+                        self.award_medal(5);
+                        tracing::info!("Race finished in {:.2}s — medal 5 awarded!", time_secs);
+                    }
+                    driving::DriveEvent::BridgeSound { wooden } => {
+                        if let Some(snd) = &mut self.sound {
+                            if wooden {
+                                snd.play_by_name(driving::WBRIDGE_CREAK_SOUND, &self.assets);
+                            } else {
+                                snd.play_by_name(driving::CBRIDGE_SOUND, &self.assets);
+                            }
+                        }
+                    }
+                    driving::DriveEvent::FarAwayReached { object_id } => {
+                        self.award_medal(2);
+                        tracing::info!("FarAway object {} reached — medal 2 awarded!", object_id);
+                    }
+                    driving::DriveEvent::SoundTrigger { sound_id } => {
+                        if let Some(snd) = &mut self.sound {
+                            snd.play_by_name(&sound_id, &self.assets);
                         }
                     }
                     _ => {}
@@ -459,9 +530,35 @@ impl GameState {
                             toolbox::PopupAction::Cancel => {
                                 tb.popup_open = false;
                             }
-                            _ => {
-                                // Steering / Diploma — not implemented
-                                tracing::debug!("Popup action {:?} not implemented", action);
+                            toolbox::PopupAction::Steering => {
+                                // Toggle keyboard / mouse steering
+                                if let Some(car) = &mut self.drive_car {
+                                    car.key_steer = !car.key_steer;
+                                    tracing::info!(
+                                        "Steering mode: {}",
+                                        if car.key_steer { "keyboard" } else { "mouse" }
+                                    );
+                                }
+                                if let Some(snd) = &mut self.sound {
+                                    snd.play_by_name("09d005v0", &self.assets);
+                                }
+                                tb.popup_open = false;
+                            }
+                            toolbox::PopupAction::Diploma => {
+                                // Show earned medals info
+                                let medal_count = self
+                                    .save_manager
+                                    .active()
+                                    .map(|u| u.car.medals.len())
+                                    .unwrap_or(0);
+                                tracing::info!(
+                                    "Diploma: {}/4 medals earned",
+                                    medal_count
+                                );
+                                if let Some(snd) = &mut self.sound {
+                                    snd.play_by_name("09d002v0", &self.assets);
+                                }
+                                tb.popup_open = false;
                             }
                         }
                     }
@@ -491,7 +588,31 @@ impl GameState {
             }
         }
 
+        // Play button click sound if applicable
+        for btn in &self.scene_handler.buttons {
+            if btn.hit_test(x, y) {
+                if let Some(snd_name) = &btn.sound_default {
+                    if let Some(snd) = &mut self.sound {
+                        snd.play_by_name(snd_name, &self.assets);
+                    }
+                }
+                break;
+            }
+        }
+
         if let Some(next) = self.scene_handler.on_click(x, y, &self.assets) {
+            // Gate check: Garage → Yard requires road-legal car
+            if next == Scene::Yard && self.current_scene == Scene::Garage {
+                if !self.car.is_road_legal() {
+                    let failures = self.car.properties().road_legal_failures();
+                    let hints = dialog::road_legal_hint_sounds(&failures);
+                    for hint_id in &hints {
+                        self.play_dialog(hint_id);
+                    }
+                    tracing::info!("Garage→Yard blocked: car not road legal ({:?})", failures);
+                    return;
+                }
+            }
             self.switch_scene(next);
         }
     }
@@ -554,7 +675,11 @@ impl GameState {
         // Forward drag processing to scene handler
         let result = self.scene_handler.process_drag(x, y, down);
         self.handle_drop_result(result);
-        self.scene_handler.on_mouse_move(x, y);
+        if let Some(hover_snd) = self.scene_handler.on_mouse_move(x, y) {
+            if let Some(snd) = &mut self.sound {
+                snd.play_by_name(&hover_snd, &self.assets);
+            }
+        }
 
         // Track dragging state for cursor and UI feedback
         if self.scene_handler.drag_drop.is_dragging() {
@@ -685,6 +810,10 @@ impl GameState {
                         self.car.attach(attach_id, &self.parts_db, &self.assets)
                     {
                         tracing::info!("Attached part {} → car now has {} parts", attached_id, self.car.parts.len());
+                        // Remove part from all junk locations (prevents duplication)
+                        self.save_manager.active_mut().map(|u| {
+                            u.junk.remove_part_everywhere(attached_id as u32);
+                        });
                         self.save_manager.save_car_parts(&self.car.parts);
                         // Track special part pickups as quest cache flags
                         self.quest.add_cache(&format!("#Part{}", attached_id));
@@ -710,8 +839,57 @@ impl GameState {
                 }
             }
             drag_drop::DropResult::DroppedOnTarget { part_id, target_id } => {
-                tracing::info!("Part {} dropped on target {}", part_id, target_id);
-                // TODO: move part to another location/scene (e.g. junkyard door)
+                tracing::info!("Part {} dropped on target '{}'", part_id, target_id);
+                // Move part to the destination storage
+                let pid = part_id as u32;
+                // First remove part from ALL locations to prevent duplication
+                self.save_manager.active_mut().map(|u| {
+                    u.junk.remove_part_everywhere(pid);
+                });
+                match target_id.as_str() {
+                    "door_junk" => {
+                        // Garage → Junkyard pile 1
+                        let rx = (pid * 37 % 500 + 70) as i32;
+                        self.save_manager.active_mut().map(|u| {
+                            u.junk.pile1.insert(pid, (rx, 240));
+                        });
+                    }
+                    "door_yard" => {
+                        // Garage / Junkyard → Yard
+                        let rx = (pid * 37 % 400 + 100) as i32;
+                        self.save_manager.active_mut().map(|u| {
+                            u.junk.yard.insert(pid, (rx, 200));
+                        });
+                    }
+                    "door_shop" => {
+                        // Junkyard / Yard → Garage shop floor
+                        let rx = (pid * 37 % 400 + 100) as i32;
+                        self.save_manager.active_mut().map(|u| {
+                            u.junk.shop_floor.insert(pid, (rx, 351));
+                        });
+                    }
+                    tid if tid.starts_with("arrow_right_") || tid.starts_with("arrow_left_") => {
+                        // Junkyard → another pile
+                        if let Some(target_pile) = tid.rsplit('_').next()
+                            .and_then(|s| s.parse::<u8>().ok())
+                        {
+                            let rx = (pid * 37 % 400 + 100) as i32;
+                            self.save_manager.active_mut().map(|u| {
+                                u.junk.pile_mut(target_pile).insert(pid, (rx, 240));
+                            });
+                        }
+                    }
+                    _ => {
+                        tracing::debug!("Unknown drop target '{}'", target_id);
+                        return; // don't remove item
+                    }
+                }
+                // Remove the item from the current scene + play sound
+                self.scene_handler.drag_drop.remove_by_part_id(pid);
+                if let Some(snd) = &mut self.sound {
+                    snd.play_by_name("00e004v0", &self.assets);
+                }
+                self.save_manager.save();
             }
             drag_drop::DropResult::Dropped { part_id } => {
                 tracing::debug!("Part {} dropped in place", part_id);
@@ -974,9 +1152,52 @@ impl GameState {
             sprites.sort_by_key(|s| s.z_order);
         }
 
-        // On World map, render the driving car sprite + dashboard HUD
+        // On World map, render map-object sprites, driving car sprite + dashboard HUD
         if self.current_scene == Scene::World {
             if let Some(car) = &self.drive_car {
+                // --- Map object sprites (behind / in front of car) ---
+                let cache_list: Vec<String> = self.quest.cache_list().to_vec();
+                let medals: Vec<String> = self.save_manager.active()
+                    .map(|u| u.car.medals.clone())
+                    .unwrap_or_default();
+                if let Some(wm) = &self.world_map {
+                    let tile_objects: Vec<driving::MapObject> = wm
+                        .tile_at(car.tile_col, car.tile_row)
+                        .and_then(|tid| wm.get_tile(tid))
+                        .map(|t| t.objects.clone())
+                        .unwrap_or_default();
+                    let mut z_under_idx = 500i32;
+                    let mut z_over_idx = 1500i32;
+                    for mut obj in tile_objects {
+                        obj.do_check(&cache_list, &medals);
+                        if !obj.enabled { continue; }
+                        if let Some(ref sname) = obj.sprite_name {
+                            if let Some(bmp) = self.assets.find_bitmap_by_name(sname) {
+                                let z = if obj.z_under {
+                                    z_under_idx += 1;
+                                    z_under_idx
+                                } else {
+                                    z_over_idx += 1;
+                                    z_over_idx
+                                };
+                                sprites.push(Sprite {
+                                    x: obj.x - bmp.width as i32 / 2,
+                                    y: obj.y - bmp.height as i32 / 2,
+                                    width: bmp.width,
+                                    height: bmp.height,
+                                    pixels: bmp.pixels,
+                                    visible: true,
+                                    z_order: z,
+                                    name: format!("map_obj_{}", obj.object_id),
+                                    interactive: false,
+                                    member_num: 0,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // --- Driving car sprite ---
                 let member = car.sprite_member();
                 // Lookup sprite bitmap from 05.DXR cast member
                 if let Some(bmp) = self.assets.decode_bitmap_transparent("05.DXR", member) {
@@ -987,7 +1208,7 @@ impl GameState {
                         height: bmp.height,
                         pixels: bmp.pixels,
                         visible: true,
-                        z_order: 1000, // car on top of map
+                        z_order: 1000, // car between under/over objects
                         name: format!("drive_car_d{}", car.direction),
                         interactive: true,
                         member_num: member,
@@ -1111,6 +1332,26 @@ impl GameState {
         self.play_dialog_with_actor(audio_id, None);
     }
 
+    /// Award a medal to the current car (from objects.hash.json SetWhenDone.Medals).
+    ///
+    /// Medal IDs (from objects.hash.json):
+    ///   1 = BigHill (conquered a steep hill)
+    ///   2 = FarAway (reached the far-away landmark)
+    ///   4 = Exhibition (visited the car show)
+    ///   5 = Racing (completed the race)
+    fn award_medal(&mut self, medal_id: u32) {
+        let medal_str = medal_id.to_string();
+        if let Some(user) = self.save_manager.active_mut() {
+            if !user.car.medals.contains(&medal_str) {
+                user.car.medals.push(medal_str.clone());
+                tracing::info!("Medal {} awarded! Total medals: {:?}", medal_id, user.car.medals);
+            } else {
+                tracing::debug!("Medal {} already earned", medal_id);
+            }
+        }
+        self.save_manager.save();
+    }
+
     /// Play the horn sound based on the car's horn_type (1-5).
     /// Sound IDs from mulle.js: ["05e050v0", "05e049v0", "05e044v0", "05e042v0", "05d013v0"]
     fn play_horn(&mut self) {
@@ -1155,7 +1396,14 @@ impl GameState {
 
     /// Play a dialog with a specific actor for lip-sync.
     fn play_dialog_with_actor(&mut self, audio_id: &str, actor_name: Option<&str>) {
-        self.dialog.talk(audio_id);
+        // Skip dialogs cheat — suppress subtitle and audio
+        if self.dev_menu.skip_dialogs {
+            tracing::debug!("Dialog '{}' skipped (dev cheat)", audio_id);
+            return;
+        }
+        // Get audio duration so subtitles are timed to match the actual speech
+        let duration_ms = self.assets.sound_duration_ms(audio_id);
+        self.dialog.talk_timed(audio_id, duration_ms);
         if let Some(snd) = &mut self.sound {
             if let Some(handle) = snd.play_by_name(audio_id, &self.assets) {
                 // Set up cue-point tracking if the sound has cue points
@@ -1313,14 +1561,33 @@ impl GameState {
     }
 
     fn switch_scene(&mut self, scene: Scene) {
-        tracing::info!("Scene transition: {:?} -> {:?} ({})", self.current_scene, scene, scene.director_file());
+        let prev_scene = self.current_scene;
 
-        // Check for transition cutscene (only if we're not already resuming from one)
-        if self.transition.is_none() {
-            let has_car = self.car.properties().is_road_legal();
-            if let Some(cutscene_name) = transition_cutscene(&self.current_scene, &scene, has_car) {
-                // Look up the cutscene member by name in 00.CXT
-                if let Some((fname, num)) = self.assets.find_sound_by_name(cutscene_name) {
+        // Skip redundant transition (e.g. cutscene already set current_scene)
+        if prev_scene == scene {
+            // Still need to load the scene handler + entry setup
+            // (fall through to scene-entry below, skip exit + cutscene logic)
+        } else {
+            tracing::info!("Scene transition: {:?} -> {:?} ({})", prev_scene, scene, scene.director_file());
+
+            // Update current_scene early so the cutscene lookup won't re-match
+            // on the next call after the cutscene finishes (prevents infinite loop).
+            self.current_scene = scene;
+
+            // Check for transition cutscene (only if we're not already resuming from one)
+            if self.transition.is_none() {
+                let has_car = self.car.properties().is_road_legal();
+                if let Some(cutscene_spec) = transition_cutscene(&prev_scene, &scene, has_car) {
+                // Resolve cutscene member to (file, member_num)
+                let resolved: Option<(String, u32)> = match cutscene_spec {
+                    CutsceneMember::Named(name) => {
+                        self.assets.find_sound_by_name(name).map(|(f, n)| (f, n))
+                    }
+                    CutsceneMember::Number(num) => {
+                        Some(("00.CXT".to_string(), num))
+                    }
+                };
+                if let Some((fname, num)) = resolved {
                     if let Some(bmp) = self.assets.decode_bitmap_transparent(&fname, num) {
                         let cx = (640 - bmp.width as i32) / 2;
                         let cy = (480 - bmp.height as i32) / 2;
@@ -1359,7 +1626,7 @@ impl GameState {
         self.cursor.reset();
 
         // --- Scene exit logic ---
-        match self.current_scene {
+        match prev_scene {
             Scene::World => {
                 // Save driving session when leaving the world map
                 if let Some(car) = &self.drive_car {
@@ -1422,7 +1689,8 @@ impl GameState {
 
             // Extract start data from world map (clone to avoid borrow conflicts)
             let (start_topo, start_info) = {
-                let wm = self.world_map.as_ref().unwrap();
+                let wm = self.world_map.as_ref()
+                    .expect("world_map must be initialised for driving scene");
                 let st = wm.start_tile;
                 let mut topo = String::new();
                 let mut info = None;
@@ -1446,7 +1714,8 @@ impl GameState {
             let topo_name = if self.drive_session.active {
                 let col = self.drive_session.tile_col;
                 let row = self.drive_session.tile_row;
-                let wm = self.world_map.as_ref().unwrap();
+                let wm = self.world_map.as_ref()
+                    .expect("world_map must be initialised for driving scene");
                 wm.tile_at(col, row)
                     .and_then(|tid| wm.get_tile(tid))
                     .map(|t| t.topology.clone())
@@ -1482,23 +1751,25 @@ impl GameState {
         }
 
         // --- Login on menu → garage transition ---
-        if self.current_scene == Scene::Menu && scene == Scene::Garage {
+        if prev_scene == Scene::Menu && scene == Scene::Garage {
             // Auto-login default profile
             self.login_user("default");
         }
 
         // --- Destination interactions (legacy — now handled by SceneScript) ---
         // Save quest state when leaving a destination
-        if let Scene::Destination(_) = self.current_scene {
+        if let Scene::Destination(_) = prev_scene {
             self.save_quest_state();
         }
 
         // Reset quest cache when leaving yard (as per mulle.js behavior)
-        if self.current_scene == Scene::Yard && scene != Scene::Garage {
+        if prev_scene == Scene::Yard && scene != Scene::Garage {
             self.quest.reset_cache();
         }
 
-        self.current_scene = scene;
+        } // end of `if prev_scene != scene` block
+
+        // (current_scene already set above)
         let has_car = self.car.is_road_legal();
 
         // For CarShow, compute rating and pass it to the scene handler
@@ -1508,6 +1779,7 @@ impl GameState {
             self.scene_handler = scenes::SceneHandler::new_with_rating(scene, &self.assets, has_car, rating);
             self.active_script = Some(scene_script::build_carshow_script(ff));
             tracing::info!("CarShow: funny_factor={}, rating={}", ff, rating);
+            self.award_medal(4); // Exhibition medal
         } else {
             self.scene_handler = scenes::SceneHandler::new(scene, &self.assets, has_car);
 
@@ -1558,43 +1830,69 @@ impl GameState {
             }
             // Log total part IDs for debugging
             tracing::debug!("PartsDB: {} total IDs available", self.parts_db.all_ids().len());
+
+            // Spawn shop-floor parts (loose parts on the garage floor)
+            let floor_parts = self.save_manager.active()
+                .map(|u| u.junk.shop_floor.clone())
+                .unwrap_or_default();
+            if !floor_parts.is_empty() {
+                tracing::debug!("Garage shop floor: spawning {} parts", floor_parts.len());
+                self.spawn_parts_from_map(&floor_parts, true);
+            }
+        }
+
+        if scene == Scene::Yard {
+            // Spawn yard parts (quest rewards / parts dragged here)
+            let yard_parts = self.save_manager.active()
+                .map(|u| u.junk.yard.clone())
+                .unwrap_or_default();
+            if !yard_parts.is_empty() {
+                tracing::debug!("Yard: spawning {} parts", yard_parts.len());
+                self.spawn_parts_from_map(&yard_parts, true);
+            }
+
+            // Deliver pending missions (telephone ring or mail)
+            if self.save_manager.has_pending_missions() {
+                if let Some(mid) = self.save_manager.pop_pending_mission() {
+                    let missions = dialog::MissionDB::load();
+                    if let Some(mission) = missions.get(mid) {
+                        tracing::info!("Delivering mission {}: {:?} sound={}",
+                            mid, mission.delivery, mission.sound);
+                        // Play mission sound
+                        if let Some(snd) = &mut self.sound {
+                            snd.play_by_name(&mission.sound, &self.assets);
+                        }
+                        // For mail missions, show the mail image as an overlay
+                        if mission.delivery == dialog::MissionDelivery::Mail && !mission.image.is_empty() {
+                            if let Some(bmp) = self.assets.find_bitmap_by_name(&mission.image) {
+                                let sprite = Sprite {
+                                    x: 320 - bmp.width as i32 / 2,
+                                    y: 240 - bmp.height as i32 / 2,
+                                    width: bmp.width,
+                                    height: bmp.height,
+                                    pixels: bmp.pixels,
+                                    visible: true,
+                                    z_order: 9000, // on top of everything
+                                    name: format!("mail_mission_{}", mid),
+                                    interactive: true,
+                                    member_num: 0,
+                                };
+                                self.scene_handler.sprites.push(sprite);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if scene == Scene::Junkyard {
-            // Populate draggable items from junkyard parts
-            // Use part category system to filter parts for the junkman
-            let junkman_ids = parts_db::PartsDB::junkman_part_ids();
-            let dest_ids = parts_db::PartsDB::destination_part_ids();
-            let random_ids = parts_db::PartsDB::random_part_ids();
-            tracing::debug!("Part categories: {} junkman, {} destination, {} random",
-                junkman_ids.len(), dest_ids.len(), random_ids.len());
-
-            let junk_parts = self.parts_db.junkyard_parts();
-            for (i, part_data) in junk_parts.iter().enumerate() {
-                let pid = part_data.part_id;
-                let category = self.parts_db.part_category(pid);
-                tracing::trace!("Junk part {} - category: {:?}, has_use_view: {}, color: {}, covers: {:?}, desc: '{}'",
-                    pid, category, part_data.has_use_view(),
-                    part_data.properties.color, part_data.covers, part_data.description);
-                let x = 60 + (i as i32 % 8) * 70;
-                let y = 120 + (i as i32 / 8) * 60;
-                // Create a placeholder sprite for the junk item
-                let junk_sprite = Sprite {
-                    x,
-                    y,
-                    width: 40,
-                    height: 40,
-                    pixels: vec![0; 40 * 40 * 4], // transparent placeholder
-                    visible: true,
-                    z_order: 100 + i as i32,
-                    name: format!("junk_{}", pid),
-                    interactive: true,
-                    member_num: pid,
-                };
-                let mut item = drag_drop::DraggableItem::new(pid, x, y, junk_sprite, 100 + i as i32);
-                item.physics_enabled = true;
-                self.scene_handler.drag_drop.add_item(item);
-            }
+            // Spawn parts from the current pile (from save data)
+            let pile_idx = self.current_pile_index();
+            let pile_parts = self.save_manager.active()
+                .map(|u| u.junk.pile(pile_idx).clone())
+                .unwrap_or_default();
+            tracing::debug!("Junkyard pile {}: {} parts", pile_idx, pile_parts.len());
+            self.spawn_parts_from_map(&pile_parts, true);
         }
 
         self.play_scene_sounds();
@@ -1605,6 +1903,71 @@ impl GameState {
         self.save_manager.active()
             .map(|u| u.my_last_pile)
             .unwrap_or(1)
+    }
+
+    /// Create a Sprite for a part by resolving its `junk_view` member name
+    /// through `find_bitmap_by_name`. Falls back to a tinted 32×32 placeholder
+    /// if the bitmap cannot be found.
+    fn make_part_sprite(&self, part_id: u32, x: i32, y: i32, z: i32) -> Sprite {
+        let junk_view = self.parts_db.get(part_id)
+            .map(|p| p.junk_view.clone())
+            .unwrap_or_default();
+
+        if !junk_view.is_empty() {
+            if let Some(bmp) = self.assets.find_bitmap_by_name(&junk_view) {
+                return Sprite {
+                    x,
+                    y,
+                    width: bmp.width,
+                    height: bmp.height,
+                    pixels: bmp.pixels,
+                    visible: true,
+                    z_order: z,
+                    name: format!("part_{}", part_id),
+                    interactive: true,
+                    member_num: part_id,
+                };
+            }
+            tracing::trace!("Bitmap '{}' for part {} not found, using placeholder", junk_view, part_id);
+        }
+
+        // Fallback: coloured placeholder so parts are at least visible
+        let sz: u32 = 32;
+        // Deterministic colour from part_id
+        let r = ((part_id * 37) % 200 + 55) as u8;
+        let g = ((part_id * 73) % 200 + 55) as u8;
+        let b = ((part_id * 113) % 200 + 55) as u8;
+        let mut pixels = vec![0u8; (sz * sz * 4) as usize];
+        for i in 0..(sz * sz) as usize {
+            pixels[i * 4] = r;
+            pixels[i * 4 + 1] = g;
+            pixels[i * 4 + 2] = b;
+            pixels[i * 4 + 3] = 200; // slightly transparent
+        }
+        Sprite {
+            x, y,
+            width: sz,
+            height: sz,
+            pixels,
+            visible: true,
+            z_order: z,
+            name: format!("part_{}", part_id),
+            interactive: true,
+            member_num: part_id,
+        }
+    }
+
+    /// Spawn a set of parts (from save data HashMap) as DraggableItems
+    /// into the scene's drag_drop system. Used for junkyard piles,
+    /// shop floor, and yard.
+    fn spawn_parts_from_map(&mut self, parts: &std::collections::HashMap<u32, (i32, i32)>, physics: bool) {
+        for (i, (&pid, &(x, y))) in parts.iter().enumerate() {
+            let z = 100 + i as i32;
+            let sprite = self.make_part_sprite(pid, x, y, z);
+            let mut item = drag_drop::DraggableItem::new(pid, x, y, sprite, z);
+            item.physics_enabled = physics;
+            self.scene_handler.drag_drop.add_item(item);
+        }
     }
 
     /// Load a topology bitmap by member name (e.g. "30t001v0") into `topo_data`.
@@ -1657,28 +2020,23 @@ impl GameState {
                 // See build_menu_script() in scene_script.rs
             }
             Scene::Garage => {
-                // Garage ambient sounds
-                snd.play_background("03e009v0", &self.assets);
-                // Mulle workshop greeting
-                snd.play_by_name("03e010v0", &self.assets);
+                // Garage has no dedicated BG loop per mulle.js
+                // One-shot greeting sounds played by scene script
             }
             Scene::Junkyard => {
-                // Junkyard ambient
-                snd.play_background("02e015v0", &self.assets);
-                // Arrival sound
-                snd.play_by_name("02e016v0", &self.assets);
+                // Junkyard ambient BG loop (shared with Yard)
+                snd.play_background("02e010v0", &self.assets);
             }
             Scene::Yard => {
-                // Outdoor ambient — use shared sound
-                snd.play_by_name("00e004v0", &self.assets);
+                // Outdoor ambient BG loop (shared with Junkyard)
+                snd.play_background("02e010v0", &self.assets);
             }
             Scene::World => {
-                // Driving / map ambient
-                snd.play_by_name("00e004v0", &self.assets);
+                // Driving engine sounds handled by driving system
             }
             Scene::CarShow => {
-                // Car show fanfare
-                snd.play_by_name("94e001v0", &self.assets);
+                // Car show crowd ambient loop
+                snd.play_background("94e001v0", &self.assets);
                 // Save the car's name when entering the car show
                 let car_name = self.save_manager.active()
                     .map(|u| u.car.name.clone())
@@ -1688,9 +2046,13 @@ impl GameState {
                 tracing::info!("Car show: saved car name '{}'", display_name);
             }
             Scene::Destination(n) => {
-                // Destination-specific sounds
+                // Destination-specific ambient loops
                 match n {
-                    92 => { snd.play_by_name("92e002v0", &self.assets); }
+                    85 => { snd.play_background("85e001v0", &self.assets); } // Roaddog (Salka)
+                    86 => { snd.play_background("86e005v0", &self.assets); } // Solhem (Mia)
+                    88 => { snd.play_background("88e001v0", &self.assets); } // Sture Stortand
+                    92 => { snd.play_background("92e002v0", &self.assets); } // Figge Ferrum
+                    // 87 (Saftfabrik), 84 (Roadthing) — no BG loop per mulle.js
                     _ => {}
                 }
             }

@@ -194,11 +194,31 @@ impl DialogManager {
     }
 
     /// Start a dialog (or queue it if one is playing)
+    #[allow(dead_code)] // Public API — useful for callers without audio duration info
     pub fn talk(&mut self, audio_id: &str) {
-        let lines = self.subtitle_db
+        self.talk_timed(audio_id, 0);
+    }
+
+    /// Start a dialog with known audio duration (ms).
+    /// If `audio_duration_ms > 0`, subtitle line durations are scaled so
+    /// the total subtitle time matches the audio length.
+    pub fn talk_timed(&mut self, audio_id: &str, audio_duration_ms: u32) {
+        let mut lines = self.subtitle_db
             .get(audio_id)
             .cloned()
             .unwrap_or_else(|| vec![SubtitleLine::new(&format!("[{}]", audio_id), "?")]);
+
+        // Scale subtitle durations to match actual audio length
+        if audio_duration_ms > 0 && !lines.is_empty() {
+            let total_text: u32 = lines.iter().map(|l| l.duration_ms).sum();
+            if total_text > 0 {
+                for line in &mut lines {
+                    line.duration_ms = (line.duration_ms as u64 * audio_duration_ms as u64
+                        / total_text as u64) as u32;
+                    line.duration_ms = line.duration_ms.max(300); // min 300ms per line
+                }
+            }
+        }
 
         let seq = DialogSequence::new(audio_id, lines);
 
@@ -310,26 +330,27 @@ impl DialogManager {
         // (the "description" field is an audio member name like "20d038v0")
 
         // Road legality hints (from isRoadLegal talk=true)
-        self.set_lines("03d040v0", vec![
-            SubtitleLine::new("- Du brauchst noch einen Motor!", "mulle"),
-        ]);
-        self.set_lines("03d041v0", vec![
+        // Sound IDs from mulle.js cardata.js
+        self.set_lines("03d012v0", vec![
             SubtitleLine::new("- Du brauchst noch Räder!", "mulle"),
         ]);
-        self.set_lines("03d042v0", vec![
-            SubtitleLine::new("- Du brauchst noch Bremsen!", "mulle"),
+        self.set_lines("03d013v0", vec![
+            SubtitleLine::new("- Du brauchst noch einen Motor!", "mulle"),
         ]);
-        self.set_lines("03d043v0", vec![
-            SubtitleLine::new("- Du brauchst noch ein Lenkrad!", "mulle"),
-        ]);
-        self.set_lines("03d044v0", vec![
-            SubtitleLine::new("- Du brauchst noch einen Tank!", "mulle"),
-        ]);
-        self.set_lines("03d045v0", vec![
+        self.set_lines("03d014v0", vec![
             SubtitleLine::new("- Du brauchst noch eine Batterie!", "mulle"),
         ]);
-        self.set_lines("03d046v0", vec![
+        self.set_lines("03d015v0", vec![
+            SubtitleLine::new("- Du brauchst noch einen Tank!", "mulle"),
+        ]);
+        self.set_lines("03d016v0", vec![
             SubtitleLine::new("- Du brauchst noch ein Getriebe!", "mulle"),
+        ]);
+        self.set_lines("03d017v0", vec![
+            SubtitleLine::new("- Du brauchst noch ein Lenkrad!", "mulle"),
+        ]);
+        self.set_lines("03d018v0", vec![
+            SubtitleLine::new("- Du brauchst noch Bremsen!", "mulle"),
         ]);
 
         // Fuel empty on road
@@ -343,11 +364,14 @@ impl DialogManager {
             SubtitleLine::new("- Hast du ihn gesehen?", "figge"),
         ]);
         self.set_lines("92d003v0", vec![
-            SubtitleLine::new("- Danke, dass du {Salka} zurückgebracht hast!", "figge"),
-            SubtitleLine::new("- Hier, nimm diesen Extra-Tank als Belohnung.", "figge"),
+            SubtitleLine::new("- Nein, ich habe deinen Hund nicht gesehen.", "mulle"),
         ]);
         self.set_lines("92d004v0", vec![
-            SubtitleLine::new("- Nein, ich habe deinen Hund nicht gesehen.", "mulle"),
+            SubtitleLine::new("- Ja, klar!", "mulle"),
+        ]);
+        self.set_lines("92d005v0", vec![
+            SubtitleLine::new("- Danke, dass du {Salka} zurückgebracht hast!", "figge"),
+            SubtitleLine::new("- Hier, nimm diesen Extra-Tank als Belohnung.", "figge"),
         ]);
     }
 }
@@ -466,14 +490,15 @@ impl MissionDB {
         let mut missions = HashMap::new();
 
         let data = [
+            // From missions.hash.json: (id, delivery_type, mail_image, sound)
             (1, MissionDelivery::Telephone, "", "50d001v0"),
             (2, MissionDelivery::Mail, "50b001v0", "50d016v0"),
-            (3, MissionDelivery::Telephone, "", "50d003v0"),
-            (4, MissionDelivery::Mail, "50b002v0", "50d004v0"),
-            (5, MissionDelivery::Telephone, "", "50d005v0"),
-            (6, MissionDelivery::Mail, "50b003v0", "50d006v0"),
-            (7, MissionDelivery::Telephone, "", "50d007v0"),
-            (8, MissionDelivery::Mail, "50b004v0", "50d008v0"),
+            (3, MissionDelivery::Mail, "50b002v0", "50d017v0"),
+            (4, MissionDelivery::Telephone, "", "50d018v0"),
+            (5, MissionDelivery::Telephone, "", "50d019v0"),
+            (6, MissionDelivery::Telephone, "", "50d020v0"),
+            (7, MissionDelivery::Mail, "50b003v0", "50d021v0"),
+            (8, MissionDelivery::Mail, "50b004v0", "50d022v0"),
         ];
 
         for (id, delivery, image, sound) in data {
@@ -504,14 +529,14 @@ pub fn road_legal_hint_sounds(failures: &[&str]) -> Vec<&'static str> {
     let mut sounds = Vec::new();
     for &failure in failures {
         let sound = match failure {
-            "engine" => "03d040v0",
-            "tires" => "03d041v0",
-            "brake" => "03d042v0",
-            "steering" => "03d043v0",
-            "fuel_tank" => "03d044v0",
-            "battery" => "03d045v0",
-            "gearbox" => "03d046v0",
-            "fuel_consumption" => "03d040v0", // same as engine
+            "engine" => "03d013v0",
+            "tires" => "03d012v0",
+            "brake" => "03d018v0",
+            "steering" => "03d017v0",
+            "fuel_tank" => "03d015v0",
+            "battery" => "03d014v0",
+            "gearbox" => "03d016v0",
+            "fuel_consumption" => "03d013v0", // same as engine
             _ => continue,
         };
         sounds.push(sound);
@@ -630,6 +655,6 @@ mod tests {
         let failures = vec!["engine", "tires", "steering"];
         let sounds = road_legal_hint_sounds(&failures);
         assert_eq!(sounds.len(), 3);
-        assert_eq!(sounds[0], "03d040v0");
+        assert_eq!(sounds[0], "03d013v0");
     }
 }
