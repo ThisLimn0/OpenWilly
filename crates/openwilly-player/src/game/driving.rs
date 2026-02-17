@@ -77,6 +77,7 @@ pub const RACING_BOARD_SPRITE: &str = "31b045v0";
 /// WBridge creaking sound (from objects.hash.json Sounds[0])
 pub const WBRIDGE_CREAK_SOUND: &str = "31e003v0";
 /// WBridge "too weak" speech (from objects.hash.json Sounds[1])
+#[allow(dead_code)] // TODO: play when bridge is too weak for current car
 pub const WBRIDGE_WARN_SOUND: &str = "31d010v0";
 /// CBridge sound (from objects.hash.json Sounds[0])
 pub const CBRIDGE_SOUND: &str = "31e004v0";
@@ -994,6 +995,7 @@ pub enum DriveEvent {
     /// Sound trigger zone entered
     SoundTrigger { sound_id: String },
     /// Approach sound — played when entering outer radius of a map object
+    #[allow(dead_code)] // TODO: implement approach sound triggers
     ApproachSound { sound_id: String },
 }
 

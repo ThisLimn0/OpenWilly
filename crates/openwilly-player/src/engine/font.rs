@@ -66,6 +66,11 @@ pub fn text_width(text: &str) -> i32 {
 
 /// Draw a filled rectangle
 pub fn draw_rect(fb: &mut [u32], x: i32, y: i32, w: i32, h: i32, color: u32) {
+    let a = (color >> 24) & 0xFF;
+    let blend = a < 255;
+    let sr = ((color >> 16) & 0xFF) as u32;
+    let sg = ((color >> 8) & 0xFF) as u32;
+    let sb = (color & 0xFF) as u32;
     for dy in 0..h {
         let py = y + dy;
         if py < 0 || py >= 480 {
@@ -78,7 +83,19 @@ pub fn draw_rect(fb: &mut [u32], x: i32, y: i32, w: i32, h: i32, color: u32) {
             }
             let offset = py as usize * SCREEN_WIDTH + px as usize;
             if offset < fb.len() {
-                fb[offset] = color;
+                if blend {
+                    let dst = fb[offset];
+                    let dr = ((dst >> 16) & 0xFF) as u32;
+                    let dg = ((dst >> 8) & 0xFF) as u32;
+                    let db = (dst & 0xFF) as u32;
+                    let inv = 255 - a;
+                    let r = (sr * a + dr * inv) / 255;
+                    let g = (sg * a + dg * inv) / 255;
+                    let b = (sb * a + db * inv) / 255;
+                    fb[offset] = 0xFF000000 | (r << 16) | (g << 8) | b;
+                } else {
+                    fb[offset] = color;
+                }
             }
         }
     }

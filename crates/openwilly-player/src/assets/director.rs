@@ -340,6 +340,8 @@ impl DirectorFile {
         let mut movie_height = 480u16;
         let mut created_by = String::new();
         let mut modified_by = String::new();
+        // MCsL: cast library info (firstCast offsets)
+        let mut cast_lib_first_cast: Vec<u32> = Vec::new(); // firstCast per library
 
         for i in 0..chunks.len() {
             let chunk = &chunks[i];
@@ -348,6 +350,39 @@ impl DirectorFile {
             }
 
             match chunk.fourcc.as_str() {
+                "MCsL" => {
+                    // Parse MCsL to get firstCast offset per cast library
+                    reader.seek(SeekFrom::Start(chunk.offset as u64 + 8))?;
+                    let _unknown1 = reader.read_u32_be()?;
+                    let cast_count = reader.read_u32_be()?;
+                    let _unknown2 = reader.read_u32_be()?;
+                    let _array_size = reader.read_u32_be()?;
+                    // Read offset array (4 ints per cast lib)
+                    for _ in 0..cast_count {
+                        let _a0 = reader.read_u32_be()?;
+                        let _a1 = reader.read_u32_be()?;
+                        let _a2 = reader.read_u32_be()?;
+                        let _a3 = reader.read_u32_be()?;
+                    }
+                    let _unknown3 = reader.read_u16_be()?;
+                    let _cast_libs_length = reader.read_u32_be()?;
+                    // Read cast library entries
+                    for j in 0..cast_count {
+                        let name = reader.read_len_string().unwrap_or_default();
+                        let path = reader.read_len_string().unwrap_or_default();
+                        let is_external = !path.is_empty();
+                        if is_external {
+                            reader.skip(2)?; // extra padding for external casts
+                        }
+                        let _preload = reader.read_u8()?;
+                        let _storage = reader.read_u8()?;
+                        let member_count = reader.read_u16_be()?;
+                        let num_id = reader.read_u32_be()?; // firstCast / minCast
+                        tracing::debug!("  [{}] MCsL lib {}: name='{}' memberCount={} firstCast={} external={}",
+                            filename, j, name, member_count, num_id, is_external);
+                        cast_lib_first_cast.push(num_id);
+                    }
+                }
                 "DRCF" => {
                     reader.seek(SeekFrom::Start(chunk.offset as u64 + 8))?;
                     let v0 = reader.read_u8()?;
@@ -421,6 +456,11 @@ impl DirectorFile {
         // CAS* data is ALWAYS Big-Endian regardless of container endianness
         let mut cas_star_members: HashMap<usize, u32> = HashMap::new(); // slot -> member_num
         let mut cas_star_count = 0u32;
+        // CAS* member numbering: Director CAS* entries are simply numbered
+        // sequentially starting from 1, matching how mulle.js and the game
+        // reference cast members.  The firstCast/minCast values in MCsL are
+        // internal Director IDs and NOT used as offsets for CAS* numbering.
+        let first_cast = 1u32;
         for i in 0..chunks.len() {
             if chunks[i].fourcc != "CAS*" || chunks[i].offset == 0 {
                 continue;
@@ -428,10 +468,11 @@ impl DirectorFile {
             cas_star_count += 1;
             reader.seek(SeekFrom::Start(chunks[i].offset as u64 + 8))?;
             let count = chunks[i].length / 4;
-            tracing::debug!("  CAS* #{} at chunk {}: {} entries", cas_star_count, i, count);
+            tracing::debug!("  [{}] CAS* #{} at chunk {}: {} entries (length={}) firstCast={}",
+                filename, cas_star_count, i, count, chunks[i].length, first_cast);
             for j in 0..count {
                 let slot = reader.read_u32_be()? as usize; // Always BE
-                let member_num = j + 1;
+                let member_num = first_cast + j as u32;
                 if slot > 0 && slot < chunks.len() {
                     if let Some(old) = cas_star_members.insert(slot, member_num) {
                         tracing::warn!("  CAS* collision: slot {} was member {} now member {}", slot, old, member_num);
@@ -440,7 +481,7 @@ impl DirectorFile {
             }
         }
         if cas_star_count > 1 {
-            tracing::warn!("  {} CAS* chunks found — member numbering may be incorrect!", cas_star_count);
+            tracing::warn!("  [{}] {} CAS* chunks found — member numbering may be incorrect!", filename, cas_star_count);
         }
 
         // Parse each CASt chunk
@@ -810,6 +851,50 @@ mod tests {
                     eprintln!("  #{}: '{}' {}×{} depth={} alpha={} pal={}",
                         num, m.name, bi.width, bi.height, bi.bit_depth, bi.bit_alpha, bi.palette_ref);
                 }
+            }
+        }
+    }
+
+    /// Dump ALL cast members of 02.DXR to diagnose arrow sprite numbering
+    #[test]
+    fn dump_02_dxr_members() {
+        let path = Path::new(r"D:\Projekte\OpenWilly\game\Movies\02.DXR");
+        if !path.exists() {
+            eprintln!("SKIP: 02.DXR not found");
+            return;
+        }
+        let df = DirectorFile::parse(path).expect("Failed to parse 02.DXR");
+        eprintln!("=== 02.DXR: {} ===", df.info_line());
+        eprintln!("Total members: {}", df.cast_members.len());
+        eprintln!();
+
+        let mut nums: Vec<u32> = df.cast_members.keys().copied().collect();
+        nums.sort();
+
+        for num in &nums {
+            let m = &df.cast_members[num];
+            let type_str = format!("{:?}", m.cast_type);
+            if m.cast_type == CastType::Bitmap {
+                if let Some(bi) = &m.bitmap_info {
+                    eprintln!("  #{:4}: '{}' {} {}x{} reg=({},{}) pal={}",
+                        num, m.name, type_str, bi.width, bi.height, bi.reg_x, bi.reg_y, bi.palette_ref);
+                } else {
+                    eprintln!("  #{:4}: '{}' {} (no bitmap_info)", num, m.name, type_str);
+                }
+            } else {
+                eprintln!("  #{:4}: '{}' {}", num, m.name, type_str);
+            }
+        }
+
+        // Expected arrow members (from mulle.js junk.js):
+        // Pile 1: right=162, left=174
+        eprintln!();
+        eprintln!("--- Expected arrow members ---");
+        for &num in &[85u32, 86, 162, 163, 174, 175] {
+            if let Some(m) = df.cast_members.get(&num) {
+                eprintln!("  #{}: '{}' {:?}", num, m.name, m.cast_type);
+            } else {
+                eprintln!("  #{}: NOT FOUND", num);
             }
         }
     }

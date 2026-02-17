@@ -133,6 +133,8 @@ pub struct Actor {
     pub silence_anim: Option<String>,
     /// Whether this actor is currently talking
     pub is_talking: bool,
+    /// When true, pick idle/look animation based on mouse position
+    pub mouse_track: bool,
 }
 
 impl Actor {
@@ -147,6 +149,7 @@ impl Actor {
             talk_anim: None,
             silence_anim: None,
             is_talking: false,
+            mouse_track: false,
         }
     }
 
@@ -228,6 +231,45 @@ impl Actor {
                 return;
             }
         }
+    }
+
+    /// Update the idle animation based on mouse position (MulleShopBH behavior).
+    /// Only effective when `mouse_track` is true and the actor is not talking.
+    pub fn update_mouse_track(&mut self, mx: i32, my: i32) {
+        if !self.mouse_track || !self.visible || self.is_talking {
+            return;
+        }
+        // Don't override non-looping animations (scratchChin, etc.)
+        if let Some(anim) = self.animations.get(self.active_anim) {
+            if !anim.looping && anim.playing {
+                return;
+            }
+        }
+        // Compute direction from actor to mouse
+        let dx = mx - self.x;
+        let dy = my - self.y;
+
+        let target_anim = if dy < -80 {
+            // Mouse is far above the actor → looking away
+            "turnBack"
+        } else if dx < -60 {
+            // Mouse is to the left
+            "lookLeft"
+        } else if dx > 120 {
+            // Mouse is far to the right
+            "lookRight"
+        } else {
+            // Mouse is roughly in front → gaze toward player/screen
+            "lookPlayer"
+        };
+
+        // Only switch if not already playing this animation
+        if let Some(anim) = self.animations.get(self.active_anim) {
+            if anim.name == target_anim {
+                return;
+            }
+        }
+        self.play(target_anim);
     }
 
     /// Tick the active animation. Returns an event if a non-looping animation finished.
@@ -384,16 +426,16 @@ pub struct SceneHandler {
     scene: Scene,
     pub sprites: Vec<Sprite>,
     pub buttons: Vec<MulleButton>,
-    actors: Vec<Actor>,
+    pub actors: Vec<Actor>,
     pub hotspots: Vec<Hotspot>,
     // Menu UI state
     input_text: String,
     cursor_visible: bool,
     frame_counter: u32,
-    saved_names: Vec<String>,
+    pub saved_names: Vec<String>,
     selected_name: Option<usize>,
     // Junkyard sub-state
-    junk_pile: u8,
+    pub(crate) junk_pile: u8,
     // Drag & Drop
     pub drag_drop: DragDropState,
     /// Name of the actor currently talking (for cue-point routing)
@@ -402,6 +444,8 @@ pub struct SceneHandler {
     has_car: bool,
     /// Pre-computed carshow rating (1–5), set when entering CarShow
     carshow_rating: u8,
+    /// Set when junkyard pile navigation occurs: (old_pile, new_pile)
+    pub pile_switched: Option<(u8, u8)>,
 }
 
 impl SceneHandler {
@@ -427,6 +471,7 @@ impl SceneHandler {
             talking_actor: None,
             has_car,
             carshow_rating,
+            pile_switched: None,
         };
 
         handler.load_scene(assets);
@@ -612,7 +657,13 @@ impl SceneHandler {
         mulle.add_animation("scratchChin", &[
             (b, 271), (b, 272), (b, 273), (b, 274), (b, 275), (b, 276),
         ], 10, false, assets);
+        mulle.add_animation("scratchHead", &[
+            (b, 277), (b, 278), (b, 279), (b, 280), (b, 281), (b, 282),
+        ], 10, false, assets);
         mulle.add_animation("lookLeft", &[(b, 283)], 10, true, assets);
+        mulle.add_animation("lookRight", &[(b, 286)], 10, true, assets);
+        mulle.add_animation("turnBack", &[(b, 285)], 10, true, assets);
+        mulle.mouse_track = true;
         mulle.play("idle");
         self.actors.push(mulle);
 
@@ -641,7 +692,7 @@ impl SceneHandler {
         self.load_junkyard_pile(self.junk_pile, assets);
     }
 
-    fn load_junkyard_pile(&mut self, pile: u8, assets: &AssetStore) {
+    pub fn load_junkyard_pile(&mut self, pile: u8, assets: &AssetStore) {
         let f = self.resolve_file("02", assets);
 
         // Set pile drop rects (3 stacked rects per pile from mulle.js)
@@ -650,18 +701,31 @@ impl SceneHandler {
         // Pile member data from mulle.js:
         //   (door default, door hover, right arrow default, right arrow hover,
         //    left arrow default, left arrow hover)
-        let pile_data: [(u32, u32, u32, u32, u32, u32); 6] = [
-            (85, 86, 162, 163, 174, 175), // Pile 1
-            (87, 88, 164, 165, 176, 177), // Pile 2
-            (89, 90, 166, 167, 178, 179), // Pile 3
-            (91, 92, 168, 169, 180, 181), // Pile 4
-            (93, 94, 170, 171, 182, 183), // Pile 5
-            (95, 96, 172, 173, 184, 185), // Pile 6
+        // Door members are version-independent; arrow members are resolved by name
+        // to support both Swedish and German cast layouts.
+        let pile_doors: [(u32, u32); 6] = [
+            (85, 86), (87, 88), (89, 90), (91, 92), (93, 94), (95, 96),
+        ];
+        // Arrow names: right default/hover, left default/hover per pile
+        let arrow_names: [(&str, &str, &str, &str); 6] = [
+            ("02b011v0", "02b011v1", "02b017v0", "02b017v1"),
+            ("02b012v0", "02b012v1", "02b018v0", "02b018v1"),
+            ("02b013v0", "02b013v1", "02b019v0", "02b019v1"),
+            ("02b014v0", "02b014v1", "02b020v0", "02b020v1"),
+            ("02b015v0", "02b015v1", "02b021v0", "02b021v1"),
+            ("02b016v0", "02b016v1", "02b022v0", "02b022v1"),
         ];
         let bg_names = ["02b001v0", "02b002v0", "02b003v0", "02b004v0", "02b005v0", "02b006v0"];
 
         let idx = (pile - 1).min(5) as usize;
-        let (door_def, door_hov, right_def, right_hov, left_def, left_hov) = pile_data[idx];
+        let (door_def, door_hov) = pile_doors[idx];
+        let (r_def_name, r_hov_name, l_def_name, l_hov_name) = arrow_names[idx];
+
+        // Resolve arrow members by name (version-independent)
+        let right_def = self.find_member_by_name(&f, r_def_name, assets).unwrap_or(0);
+        let right_hov = self.find_member_by_name(&f, r_hov_name, assets).unwrap_or(0);
+        let left_def = self.find_member_by_name(&f, l_def_name, assets).unwrap_or(0);
+        let left_hov = self.find_member_by_name(&f, l_hov_name, assets).unwrap_or(0);
 
         // Background by name, fallback to largest bitmap
         let bg_name = bg_names[idx];
@@ -686,48 +750,9 @@ impl SceneHandler {
             self.buttons.push(btn);
         }
 
-        // Debug: log what members exist at the expected numbers
-        if let Some(df) = assets.files.get(&f) {
-            tracing::debug!("  02.DXR has {} total cast members", df.cast_members.len());
-            for &num in &[door_def, door_hov, right_def, right_hov, left_def, left_hov] {
-                if let Some(m) = df.cast_members.get(&num) {
-                    let (w, h, rx, ry) = m.bitmap_info.as_ref()
-                        .map(|b| (b.width, b.height, b.reg_x, b.reg_y))
-                        .unwrap_or((0, 0, 0, 0));
-                    tracing::debug!("  Pile {} member #{}: name='{}' type={:?} size={}x{} reg=({},{})",
-                        pile, num, m.name, m.cast_type, w, h, rx, ry);
-                } else {
-                    tracing::warn!("  Pile {} member #{}: NOT FOUND in {}", pile, num, f);
-                }
-            }
-            // Dump arrow bitmap to file for inspection
-            if pile == 1 {
-                if let Some(bmp) = assets.decode_bitmap_transparent(&f, right_def) {
-                    let path = format!("debug_member_{}.raw", right_def);
-                    tracing::info!("Dumping member {} bitmap ({}x{}, {} pixels) to {}", right_def, bmp.width, bmp.height, bmp.pixels.len(), path);
-                    // Write as PPM for easy viewing
-                    let ppm_path = format!("debug_member_{}.ppm", right_def);
-                    let mut data = format!("P6\n{} {}\n255\n", bmp.width, bmp.height);
-                    let mut rgb_bytes = Vec::with_capacity(bmp.width as usize * bmp.height as usize * 3);
-                    for px in &bmp.pixels {
-                        rgb_bytes.push(((px >> 16) & 0xFF) as u8); // R
-                        rgb_bytes.push(((px >> 8) & 0xFF) as u8);  // G
-                        rgb_bytes.push((px & 0xFF) as u8);         // B
-                    }
-                    let _ = std::fs::write(&ppm_path, [data.as_bytes(), &rgb_bytes].concat());
-                    tracing::info!("Wrote {} (PPM image)", ppm_path);
-                }
-                // Also dump what the background lookup resolves to
-                let bg_name = bg_names[idx];
-                if let Some(bg_num) = self.find_member_by_name(&f, bg_name, assets) {
-                    tracing::info!("Background '{}' resolved to member #{}", bg_name, bg_num);
-                }
-            }
-        }
-
         // Arrow right → next pile (target=None, handled specially in on_click)
         let right_pile = if pile >= 6 { 1 } else { pile + 1 };
-        if let Some(mut btn) = MulleButton::new(
+        if let Some(btn) = MulleButton::new(
             &format!("→ Haufen {}", right_pile), &f, right_def, Some(right_hov),
             320, 240, None, 5, assets
         ) {
@@ -741,7 +766,7 @@ impl SceneHandler {
 
         // Arrow left → prev pile
         let left_pile = if pile <= 1 { 6 } else { pile - 1 };
-        if let Some(mut btn) = MulleButton::new(
+        if let Some(btn) = MulleButton::new(
             &format!("← Haufen {}", left_pile), &f, left_def, Some(left_hov),
             320, 240, None, 5, assets
         ) {
@@ -1125,8 +1150,21 @@ impl SceneHandler {
     // ─── Utility ───────────────────────────────────────────────────────
 
     pub(crate) fn resolve_file(&self, stem: &str, assets: &AssetStore) -> String {
-        let dxr = format!("{}.DXR", stem);
         let cxt = format!("{}.CXT", stem);
+        let dxr = format!("{}.DXR", stem);
+
+        // Check if the current scene's director_file explicitly names this
+        // stem — if so, honour that preference (e.g. Junkyard → 02.CXT).
+        let scene_file = self.scene.director_file();
+        let scene_stem = scene_file.split('.').next().unwrap_or("");
+        if scene_stem == stem {
+            // The scene definition is authoritative — use its extension.
+            if assets.files.contains_key(scene_file) {
+                return scene_file.to_string();
+            }
+        }
+
+        // Default: prefer DXR, fall back to CXT.
         if assets.files.contains_key(&dxr) { dxr }
         else if assets.files.contains_key(&cxt) { cxt }
         else { dxr } // fallback
@@ -1162,9 +1200,10 @@ impl SceneHandler {
     // ─── Update (animation ticking) ────────────────────────────────────
 
     /// Tick all actors. Returns any events that occurred (e.g. animation finished).
-    pub fn update(&mut self, _assets: &AssetStore) -> Vec<SceneEvent> {
+    pub fn update(&mut self, _assets: &AssetStore, mx: i32, my: i32) -> Vec<SceneEvent> {
         let mut events = Vec::new();
         for actor in &mut self.actors {
+            actor.update_mouse_track(mx, my);
             if let Some(ActorEvent::AnimationFinished { actor_name, anim_name }) = actor.tick() {
                 events.push(SceneEvent::ActorAnimFinished { actor_name, anim_name });
             }
@@ -1330,24 +1369,32 @@ impl SceneHandler {
             // Special handling for junkyard arrows (no target scene)
             if self.scene == Scene::Junkyard && btn.target.is_none() {
                 if btn.name.starts_with('→') || btn.name.starts_with("→") {
+                    let old = self.junk_pile;
                     let next = if self.junk_pile >= 6 { 1 } else { self.junk_pile + 1 };
                     self.junk_pile = next;
                     self.sprites.clear();
                     self.buttons.clear();
                     self.actors.clear();
+                    self.drag_drop.items.clear();
+                    self.drag_drop.drop_targets.clear();
                     self.hotspots.clear();
                     self.load_junkyard_pile(next, assets);
+                    self.pile_switched = Some((old, next));
                     tracing::info!("Junkyard → Pile {}", next);
                     return None;
                 }
                 if btn.name.starts_with('←') || btn.name.starts_with("←") {
+                    let old = self.junk_pile;
                     let prev = if self.junk_pile <= 1 { 6 } else { self.junk_pile - 1 };
                     self.junk_pile = prev;
                     self.sprites.clear();
                     self.buttons.clear();
                     self.actors.clear();
+                    self.drag_drop.items.clear();
+                    self.drag_drop.drop_targets.clear();
                     self.hotspots.clear();
                     self.load_junkyard_pile(prev, assets);
+                    self.pile_switched = Some((old, prev));
                     tracing::info!("Junkyard → Pile {}", prev);
                     return None;
                 }
@@ -1381,6 +1428,10 @@ impl SceneHandler {
         None
     }
 
+    /// Debug helper: right-click to hide/show scene sprites.
+    /// Currently unused — `Game::on_right_click()` handles right-click for
+    /// car part detach instead.
+    #[allow(dead_code)]
     pub fn on_right_click(&mut self, x: i32, y: i32) {
         for sprite in self.sprites.iter_mut().rev() {
             if sprite.member_num == 0 { continue; }
@@ -1493,25 +1544,28 @@ impl SceneHandler {
 
     // ─── Menu UI ────────────────────────────────────────────────────────
 
-    const NAME_FIELD_X: i32 = 90;
-    const NAME_FIELD_Y: i32 = 60;
-    const NAME_FIELD_W: i32 = 180;
-    const NAME_FIELD_H: i32 = 22;
+    // Coordinates matched to the sign/paper areas in the background bitmap (11b001v0).
+    // Left sign paper region: x 84..294, y 56..106  →  name input field
+    // Right sign paper region: x 327..556, y 53..260  →  name list + buttons
+    const NAME_FIELD_X: i32 = 86;
+    const NAME_FIELD_Y: i32 = 58;
+    const NAME_FIELD_W: i32 = 206;
+    const NAME_FIELD_H: i32 = 46;
 
-    const NAME_LIST_X: i32 = 350;
-    const NAME_LIST_Y: i32 = 60;
-    const NAME_LIST_W: i32 = 230;
-    const NAME_LIST_H: i32 = 160;
-    const NAME_LIST_ITEM_H: i32 = 25;
+    const NAME_LIST_X: i32 = 330;
+    const NAME_LIST_Y: i32 = 56;
+    const NAME_LIST_W: i32 = 222;
+    const NAME_LIST_H: i32 = 150;
+    const NAME_LIST_ITEM_H: i32 = 22;
 
-    const PLAY_BTN_X: i32 = 350;
-    const PLAY_BTN_Y: i32 = 234;
-    const PLAY_BTN_W: i32 = 110;
+    const PLAY_BTN_X: i32 = 330;
+    const PLAY_BTN_Y: i32 = 218;
+    const PLAY_BTN_W: i32 = 108;
     const PLAY_BTN_H: i32 = 28;
 
-    const DELETE_BTN_X: i32 = 470;
-    const DELETE_BTN_Y: i32 = 234;
-    const DELETE_BTN_W: i32 = 110;
+    const DELETE_BTN_X: i32 = 444;
+    const DELETE_BTN_Y: i32 = 218;
+    const DELETE_BTN_W: i32 = 108;
     const DELETE_BTN_H: i32 = 28;
 
     pub fn on_char_input(&mut self, ch: char) {
@@ -1536,7 +1590,7 @@ impl SceneHandler {
         Some(Scene::Garage)
     }
 
-    fn effective_name(&self) -> String {
+    pub fn effective_name(&self) -> String {
         if !self.input_text.trim().is_empty() {
             self.input_text.trim().to_string()
         } else if let Some(idx) = self.selected_name {
@@ -1582,33 +1636,48 @@ impl SceneHandler {
         None
     }
 
+    /// Return UI element rects for debug hitbox display: (x, y, w, h, label).
+    pub fn get_ui_rects(&self) -> Vec<(i32, i32, i32, i32, &'static str)> {
+        if self.scene != Scene::Menu { return Vec::new(); }
+        vec![
+            (Self::NAME_FIELD_X, Self::NAME_FIELD_Y, Self::NAME_FIELD_W, Self::NAME_FIELD_H, "NameField"),
+            (Self::NAME_LIST_X, Self::NAME_LIST_Y, Self::NAME_LIST_W, Self::NAME_LIST_H, "NameList"),
+            (Self::PLAY_BTN_X, Self::PLAY_BTN_Y, Self::PLAY_BTN_W, Self::PLAY_BTN_H, "PlayBtn"),
+            (Self::DELETE_BTN_X, Self::DELETE_BTN_Y, Self::DELETE_BTN_W, Self::DELETE_BTN_H, "DeleteBtn"),
+        ]
+    }
+
     pub fn draw_ui(&mut self, fb: &mut [u32]) {
         if self.scene != Scene::Menu { return; }
 
         self.frame_counter = self.frame_counter.wrapping_add(1);
         self.cursor_visible = (self.frame_counter / 15) % 2 == 0;
 
-        // Name input field
+        // Name input field — the paper area in the background is already white,
+        // so we only draw a subtle tint + outline instead of an opaque white box.
         font::draw_rect(fb, Self::NAME_FIELD_X, Self::NAME_FIELD_Y,
-            Self::NAME_FIELD_W, Self::NAME_FIELD_H, 0xFFFFFFFF);
+            Self::NAME_FIELD_W, Self::NAME_FIELD_H, 0x44FFFFFF);
         font::draw_rect_outline(fb, Self::NAME_FIELD_X, Self::NAME_FIELD_Y,
-            Self::NAME_FIELD_W, Self::NAME_FIELD_H, 0xFF333333);
-        font::draw_text_shadow(fb, Self::NAME_FIELD_X, Self::NAME_FIELD_Y - 14,
-            "Dein Name:", 0xFFFFFF00);
+            Self::NAME_FIELD_W, Self::NAME_FIELD_H, 0xFF666644);
+        // Label inside the top of the field
+        font::draw_text(fb, Self::NAME_FIELD_X + 4, Self::NAME_FIELD_Y + 4,
+            "Dein Name:", 0xFF666644);
 
         let display_text = self.input_text.clone();
-        font::draw_text(fb, Self::NAME_FIELD_X + 4, Self::NAME_FIELD_Y + 6,
+        // Text on the lower half of the field
+        let text_y = Self::NAME_FIELD_Y + 22;
+        font::draw_text(fb, Self::NAME_FIELD_X + 4, text_y,
             &display_text, 0xFF000000);
         if self.cursor_visible && self.selected_name.is_none() {
             let cx = Self::NAME_FIELD_X + 4 + font::text_width(&display_text);
-            font::draw_text(fb, cx, Self::NAME_FIELD_Y + 6, "_", 0xFF000000);
+            font::draw_text(fb, cx, text_y, "_", 0xFF000000);
         }
 
-        // Name list
+        // Name list — same approach: subtle tint on the existing paper
         font::draw_rect(fb, Self::NAME_LIST_X, Self::NAME_LIST_Y,
-            Self::NAME_LIST_W, Self::NAME_LIST_H, 0xFFFFFFFF);
+            Self::NAME_LIST_W, Self::NAME_LIST_H, 0x44FFFFFF);
         font::draw_rect_outline(fb, Self::NAME_LIST_X, Self::NAME_LIST_Y,
-            Self::NAME_LIST_W, Self::NAME_LIST_H, 0xFF333333);
+            Self::NAME_LIST_W, Self::NAME_LIST_H, 0xFF666644);
 
         if self.saved_names.is_empty() {
             font::draw_text(fb, Self::NAME_LIST_X + 8, Self::NAME_LIST_Y + 8,
@@ -1653,7 +1722,7 @@ impl SceneHandler {
             Self::DELETE_BTN_Y + (Self::DELETE_BTN_H - 8) / 2, dt, 0xFFFFFFFF);
 
         // Hint
-        font::draw_text_shadow(fb, Self::NAME_LIST_X, Self::DELETE_BTN_Y + 40,
+        font::draw_text_shadow(fb, Self::PLAY_BTN_X, Self::DELETE_BTN_Y + 34,
             "Enter=Spielen | F1-F9=Szene", 0xFFCCCCCC);
     }
 }

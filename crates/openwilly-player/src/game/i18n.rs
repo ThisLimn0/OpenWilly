@@ -42,6 +42,8 @@ pub fn t(lang: Language, key: &str) -> &'static str {
         (Language::English, "menu_fullscreen") => "Toggle Fullscreen",
         (Language::German, "menu_detail_noise") => "Detail-Rauschen",
         (Language::English, "menu_detail_noise") => "Detail Noise",
+        (Language::German, "menu_display_mode") => "Anzeigemodus",
+        (Language::English, "menu_display_mode") => "Display Mode",
         (Language::German, "menu_quit") => "Beenden",
         (Language::English, "menu_quit") => "Quit",
         (Language::German, "pause_hint") => "Pfeiltasten + Enter | Esc",
@@ -104,7 +106,7 @@ mod tests {
     fn all_german_keys_have_english() {
         let keys = [
             "pause_title", "menu_resume", "menu_fullscreen", "menu_detail_noise",
-            "menu_quit", "pause_hint", "lang_label", "road_legal", "not_road_legal",
+            "menu_display_mode", "menu_quit", "pause_hint", "lang_label", "road_legal", "not_road_legal",
             "dev_title", "dev_hint", "dev_infinite_fuel", "dev_noclip",
             "dev_hitboxes", "dev_skip_dialog", "dev_meme", "dev_detail_noise",
             "dev_goto_garage", "dev_goto_yard", "dev_goto_world",

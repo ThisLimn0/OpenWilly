@@ -179,11 +179,6 @@ impl DraggableItem {
         item
     }
 
-    /// Hit-test using the junk_sprite
-    pub fn hit_test(&self, px: i32, py: i32) -> bool {
-        self.junk_sprite.hit_test(px, py)
-    }
-
     /// Bounding box hit-test
     pub fn bbox_hit(&self, px: i32, py: i32) -> bool {
         self.junk_sprite.bbox_hit(px, py)
@@ -265,12 +260,12 @@ pub struct DragDropState {
     /// Snap targets on the car (attachment points)
     pub snap_targets: Vec<SnapTarget>,
     /// Index of the currently dragged item (if any)
-    dragging_idx: Option<usize>,
+    pub dragging_idx: Option<usize>,
     /// Offset from item origin to grab point
-    grab_offset_x: i32,
-    grab_offset_y: i32,
+    pub grab_offset_x: i32,
+    pub grab_offset_y: i32,
     /// Whether the mouse was down last frame
-    prev_mouse_down: bool,
+    pub prev_mouse_down: bool,
 }
 
 impl DragDropState {
@@ -343,12 +338,13 @@ impl DragDropState {
             .collect()
     }
 
-    /// Find the topmost draggable item at (px, py) using hit-test (alpha-aware)
+    /// Find the topmost draggable item at (px, py) using bounding-box check.
+    /// We intentionally use bbox only (not alpha-aware hit_test) so that
+    /// irregularly shaped parts with transparent edges are still easy to grab.
     pub fn item_at(&self, px: i32, py: i32) -> Option<usize> {
         // Iterate from back to front (last = topmost)
         for (i, item) in self.items.iter().enumerate().rev() {
-            // Fast bbox pre-check before expensive alpha-aware hit_test
-            if item.bbox_hit(px, py) && item.hit_test(px, py) {
+            if item.bbox_hit(px, py) {
                 return Some(i);
             }
         }
@@ -426,7 +422,23 @@ impl DragDropState {
             let morph_id = active_morph.and_then(|mi| {
                 self.items[idx].morph_sprites.get(mi).map(|m| m.morph_part_id)
             });
-            // Use item center (consistent with check_snap during drag)
+
+            // For morph parts, use find_closest_snap_target from the morph offset
+            // (the morph's snap position, not the item center)
+            if let Some(mi) = active_morph {
+                if mi < self.items[idx].morph_sprites.len() {
+                    let morph = &self.items[idx].morph_sprites[mi];
+                    let point_id = self.find_closest_snap_target(morph.offset_x, morph.offset_y)
+                        .unwrap_or_else(|| format!("morph_{}", morph.morph_part_id));
+                    return DropResult::Attached {
+                        part_id,
+                        morph_id,
+                        point_id,
+                    };
+                }
+            }
+
+            // Non-morph: use item center (consistent with check_snap during drag)
             let item_cx = self.items[idx].x + self.items[idx].junk_sprite.width as i32 / 2;
             let item_cy = self.items[idx].y + self.items[idx].junk_sprite.height as i32 / 2;
             if let Some(point_id) = self.find_closest_snap_target(item_cx, item_cy) {
@@ -450,13 +462,12 @@ impl DragDropState {
         }
 
         // 3. Check if within valid drop rects — bounce back if outside
+        //    Use mouse position (not sprite top-left) for consistent bounds checking
         if !self.drop_rects.is_empty() {
-            let item_x = self.items[idx].x;
-            let item_y = self.items[idx].y;
-            let in_bounds = self.drop_rects.iter().any(|r| r.contains(item_x, item_y));
+            let in_bounds = self.drop_rects.iter().any(|r| r.contains(mx, my));
             if !in_bounds {
                 // Pick a random rect and a random point inside it (mulle.js behavior)
-                let seed = (part_id.wrapping_mul(31337)).wrapping_add(item_x as u32).wrapping_add(item_y as u32);
+                let seed = (part_id.wrapping_mul(31337)).wrapping_add(mx as u32).wrapping_add(my as u32);
                 let rect_idx = seed as usize % self.drop_rects.len();
                 let (rx, ry) = self.drop_rects[rect_idx].random_point(seed);
                 self.items[idx].x = rx;

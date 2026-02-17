@@ -23,7 +23,38 @@ enum EngineState {
     EscapeMenu { selected: usize },
 }
 
-const ESCAPE_MENU_COUNT: usize = 4; // resume, fullscreen, detail noise, quit
+const ESCAPE_MENU_COUNT: usize = 5; // resume, fullscreen, display mode, detail noise, quit
+
+/// Display scaling mode
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum DisplayMode {
+    /// Fill entire window, may distort aspect ratio on non-4:3 displays
+    Stretch,
+    /// Maintain 4:3 aspect ratio with black bars (pillarbox/letterbox)
+    Pillarbox,
+    /// Integer scaling only (1×, 2×, 3×…) centered with black padding
+    PixelPerfect,
+}
+
+impl DisplayMode {
+    /// Cycle to the next display mode
+    pub fn next(self) -> Self {
+        match self {
+            DisplayMode::Stretch => DisplayMode::Pillarbox,
+            DisplayMode::Pillarbox => DisplayMode::PixelPerfect,
+            DisplayMode::PixelPerfect => DisplayMode::Stretch,
+        }
+    }
+
+    /// Short label for the current mode (used in escape menu)
+    pub fn label(self) -> &'static str {
+        match self {
+            DisplayMode::Stretch => "Stretch",
+            DisplayMode::Pillarbox => "Pillarbox",
+            DisplayMode::PixelPerfect => "Pixel",
+        }
+    }
+}
 
 /// Sprite rendered by the engine
 #[derive(Clone, Debug)]
@@ -40,6 +71,7 @@ pub struct Sprite {
     /// If true, this sprite responds to clicks
     pub interactive: bool,
     /// Member number (for identification)
+    #[allow(dead_code)]
     pub member_num: u32,
 }
 
@@ -75,59 +107,152 @@ impl Sprite {
     }
 }
 
-/// Scale the 640x480 framebuffer to any target size using per-axis nearest-
-/// neighbor sampling. Horizontal and vertical scale factors are independent,
-/// enabling PAR adjustment (e.g. 640x480 -> 1920x1080: 3.0x H, 2.25x V).
+/// Compute the viewport rectangle (offset + size) for a given display mode.
+/// Returns `(x_offset, y_offset, viewport_width, viewport_height)`.
+fn compute_viewport(out_w: usize, out_h: usize, mode: DisplayMode) -> (usize, usize, usize, usize) {
+    match mode {
+        DisplayMode::Stretch => (0, 0, out_w, out_h),
+        DisplayMode::Pillarbox => {
+            let scale_x = out_w as f64 / SCREEN_WIDTH as f64;
+            let scale_y = out_h as f64 / SCREEN_HEIGHT as f64;
+            let scale = scale_x.min(scale_y);
+            let vw = (SCREEN_WIDTH as f64 * scale) as usize;
+            let vh = (SCREEN_HEIGHT as f64 * scale) as usize;
+            let ox = (out_w.saturating_sub(vw)) / 2;
+            let oy = (out_h.saturating_sub(vh)) / 2;
+            (ox, oy, vw, vh)
+        }
+        DisplayMode::PixelPerfect => {
+            let factor_x = out_w / SCREEN_WIDTH;
+            let factor_y = out_h / SCREEN_HEIGHT;
+            let factor = factor_x.min(factor_y).max(1);
+            let vw = SCREEN_WIDTH * factor;
+            let vh = SCREEN_HEIGHT * factor;
+            let ox = (out_w.saturating_sub(vw)) / 2;
+            let oy = (out_h.saturating_sub(vh)) / 2;
+            (ox, oy, vw, vh)
+        }
+    }
+}
+
+/// Pre-generated noise map for the detail-noise upscaling effect.
 ///
-/// When `detail_noise` is true, pixels that were NOT directly sampled from
-/// the source (i.e. duplicated neighbors) receive a subtle random brightness
-/// perturbation of +/-0.2 (mapped to +/-51 on the 0-255 channel range).
-/// This increases perceived sharpness and adds natural-looking micro-detail
-/// at higher resolutions without affecting the original source pixels.
-fn scale_to_size(src: &[u32], dst: &mut [u32], dst_w: usize, dst_h: usize, detail_noise: bool, frame: u64) {
-    // Simple LCG-based fast noise — NOT crypto-quality, just visual dither
-    let mut rng_state: u32 = (frame as u32).wrapping_mul(2654435761);
+/// Generated once per viewport size / scene change.  Each entry is either
+/// `0` (pixel is an original nearest-neighbor sample → pass through unchanged)
+/// or a non-zero `i8` brightness offset in the range `[-13, +13]` (~5%)
+/// that is applied to duplicated (non-original) pixels during scaling.
+struct NoiseMap {
+    /// Noise values, row-major, `vw × vh` entries
+    data: Vec<i8>,
+    /// Viewport dimensions this map was generated for
+    vw: usize,
+    vh: usize,
+}
 
-    for dy in 0..dst_h {
-        let sy = (dy * SCREEN_HEIGHT) / dst_h;
-        let dst_row = dy * dst_w;
+impl NoiseMap {
+    /// Generate a new noise map for the given viewport size.
+    fn generate(vw: usize, vh: usize) -> Self {
+        let len = vw * vh;
+        let mut data = vec![0i8; len];
+        // Seed with a fixed-but-varied value so the pattern looks good
+        let mut rng: u32 = 0xDEAD_BEEF;
+
+        for dy in 0..vh {
+            let _sy = (dy * SCREEN_HEIGHT) / vh;
+            let mut prev_sx: usize = usize::MAX;
+
+            for dx in 0..vw {
+                let sx = (dx * SCREEN_WIDTH) / vw;
+                if sx != prev_sx {
+                    // Original sample — no noise
+                    // data[dy * vw + dx] already 0
+                } else {
+                    // Duplicated neighbor — assign ±13 brightness offset (~5%)
+                    rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+                    let noise = ((rng >> 16) % 27) as i8 - 13;
+                    data[dy * vw + dx] = noise;
+                }
+                prev_sx = sx;
+            }
+        }
+
+        Self { data, vw, vh }
+    }
+
+    /// Check whether this map matches the current viewport dimensions.
+    fn matches(&self, vw: usize, vh: usize) -> bool {
+        self.vw == vw && self.vh == vh
+    }
+}
+
+/// Scale the 640×480 framebuffer into a viewport sub-region of the output
+/// buffer.  The rest of the output is filled with black.  When `noise_map`
+/// is provided, duplicated neighbor pixels receive the pre-generated
+/// brightness perturbation for a film-grain-like sharpening effect.
+/// The `ui_mask` (640×480, matching `src`) marks pixels drawn by the UI;
+/// noise is NOT applied to those pixels so buttons, menus and overlays
+/// stay crisp.
+fn scale_to_viewport(
+    src: &[u32],
+    dst: &mut [u32],
+    dst_w: usize,
+    _dst_h: usize,
+    vx: usize,
+    vy: usize,
+    vw: usize,
+    vh: usize,
+    noise_map: Option<&NoiseMap>,
+    ui_mask: &[bool],
+) {
+    // Clear entire output to black
+    dst.iter_mut().for_each(|p| *p = 0xFF000000);
+
+    for dy in 0..vh {
+        let sy = (dy * SCREEN_HEIGHT) / vh;
+        let dst_row = (vy + dy) * dst_w;
         let src_row = sy * SCREEN_WIDTH;
+        let noise_row = dy * vw;
 
-        // Track which source column the previous dst pixel came from,
-        // so we can detect "duplicate" (non-original) samples.
-        let mut prev_sx: usize = usize::MAX;
-
-        for dx in 0..dst_w {
-            let sx = (dx * SCREEN_WIDTH) / dst_w;
+        for dx in 0..vw {
+            let sx = (dx * SCREEN_WIDTH) / vw;
             let pixel = src[src_row + sx];
+            let dst_idx = dst_row + vx + dx;
 
-            if !detail_noise || sx != prev_sx {
-                // Original sample — output unchanged
-                dst[dst_row + dx] = pixel;
+            // Skip noise for UI pixels (buttons, menus, overlays)
+            let is_ui = ui_mask[src_row + sx];
+            let noise_val = if is_ui {
+                0
             } else {
-                // Duplicated neighbor — apply brightness noise +/-0.2
-                // Advance the LCG
-                rng_state = rng_state.wrapping_mul(1103515245).wrapping_add(12345);
-                // Map to range [-51, +51]  (0.2 * 255 ~ 51)
-                let noise = ((rng_state >> 16) % 103) as i32 - 51;
+                noise_map
+                    .map(|nm| nm.data[noise_row + dx] as i32)
+                    .unwrap_or(0)
+            };
 
+            if noise_val == 0 {
+                dst[dst_idx] = pixel;
+            } else {
                 let r = ((pixel >> 16) & 0xFF) as i32;
                 let g = ((pixel >> 8) & 0xFF) as i32;
                 let b = (pixel & 0xFF) as i32;
 
-                let r2 = (r + noise).clamp(0, 255) as u32;
-                let g2 = (g + noise).clamp(0, 255) as u32;
-                let b2 = (b + noise).clamp(0, 255) as u32;
+                let r2 = (r + noise_val).clamp(0, 255) as u32;
+                let g2 = (g + noise_val).clamp(0, 255) as u32;
+                let b2 = (b + noise_val).clamp(0, 255) as u32;
 
-                dst[dst_row + dx] = 0xFF000000 | (r2 << 16) | (g2 << 8) | b2;
+                dst[dst_idx] = 0xFF000000 | (r2 << 16) | (g2 << 8) | b2;
             }
-            prev_sx = sx;
         }
     }
 }
 
 /// Draw semi-transparent escape/pause menu overlay onto the 640x480 framebuffer
-fn draw_escape_menu(fb: &mut [u32], selected: usize, detail_noise: bool, lang: crate::game::i18n::Language) {
+fn draw_escape_menu(
+    fb: &mut [u32],
+    selected: usize,
+    detail_noise: bool,
+    display_mode: DisplayMode,
+    lang: crate::game::i18n::Language,
+) {
     // Darken the entire framebuffer
     for pixel in fb.iter_mut() {
         let r = (*pixel >> 16) & 0xFF;
@@ -136,8 +261,8 @@ fn draw_escape_menu(fb: &mut [u32], selected: usize, detail_noise: bool, lang: c
         *pixel = 0xFF000000 | ((r / 3) << 16) | ((g / 3) << 8) | (b / 3);
     }
 
-    let box_w: i32 = 280;
-    let box_h: i32 = 180;
+    let box_w: i32 = 300;
+    let box_h: i32 = 210;
     let box_x = (SCREEN_WIDTH as i32 - box_w) / 2;
     let box_y = (SCREEN_HEIGHT as i32 - box_h) / 2;
 
@@ -151,7 +276,13 @@ fn draw_escape_menu(fb: &mut [u32], selected: usize, detail_noise: bool, lang: c
         box_x + (box_w - font::text_width(title)) / 2,
         box_y + 14, title, 0xFFFFFF00);
 
-    let item_keys = ["menu_resume", "menu_fullscreen", "menu_detail_noise", "menu_quit"];
+    let item_keys = [
+        "menu_resume",
+        "menu_fullscreen",
+        "menu_display_mode",
+        "menu_detail_noise",
+        "menu_quit",
+    ];
     for (i, key) in item_keys.iter().enumerate() {
         let label = t(lang, key);
         let iy = box_y + 46 + i as i32 * 26;
@@ -160,11 +291,11 @@ fn draw_escape_menu(fb: &mut [u32], selected: usize, detail_noise: bool, lang: c
             font::draw_rect(fb, box_x + 6, iy - 2, box_w - 12, 20, 0xFF333366);
         }
         let prefix = if i == selected { "> " } else { "  " };
-        // Show toggle state for Detail-Rauschen (index 2)
-        let suffix = if i == 2 {
-            if detail_noise { " [ON]" } else { " [OFF]" }
-        } else {
-            ""
+        let mode_label = format!(" [{}]", display_mode.label());
+        let suffix: &str = match i {
+            2 => &mode_label,
+            3 => if detail_noise { " [ON]" } else { " [OFF]" },
+            _ => "",
         };
         let text = format!("{}{}{}", prefix, label, suffix);
         font::draw_text_shadow(fb, box_x + 20, iy + 2, &text, color);
@@ -180,6 +311,7 @@ pub fn run(assets: AssetStore) -> Result<()> {
     let mut fullscreen = false;
     let mut engine_state = EngineState::Playing;
     let mut prev_mouse_down = false;
+    let mut prev_right_down = false;
     let mut frame_count: u64 = 0;
 
     tracing::info!("Engine initialized, entering game loop");
@@ -188,14 +320,28 @@ pub fn run(assets: AssetStore) -> Result<()> {
     // Outer loop: window (re)creation on fullscreen toggle
     loop {
         let (win_w, win_h) = if fullscreen {
-            (1920usize, 1080usize)
+            // Query primary monitor resolution for true borderless fullscreen
+            #[cfg(target_os = "windows")]
+            {
+                extern "system" {
+                    fn GetSystemMetrics(nIndex: i32) -> i32;
+                }
+                let w = unsafe { GetSystemMetrics(0) } as usize; // SM_CXSCREEN
+                let h = unsafe { GetSystemMetrics(1) } as usize; // SM_CYSCREEN
+                if w > 0 && h > 0 { (w, h) } else { (1920, 1080) }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                (1920usize, 1080usize)
+            }
         } else {
             (SCREEN_WIDTH * 2, SCREEN_HEIGHT * 2)
         };
 
         let options = WindowOptions {
-            resize: !fullscreen,
+            resize: false,
             borderless: fullscreen,
+            topmost: fullscreen,
             scale_mode: minifb::ScaleMode::AspectRatioStretch,
             ..Default::default()
         };
@@ -217,6 +363,12 @@ pub fn run(assets: AssetStore) -> Result<()> {
         let mut scaled_buf = vec![0u32; out_w * out_h];
         let mut toggle_fs = false;
 
+        // Pre-generate noise map for the initial viewport
+        let init_mode = game.dev_menu.display_mode;
+        let (_, _, init_vw, init_vh) = compute_viewport(out_w, out_h, init_mode);
+        let mut noise_map = NoiseMap::generate(init_vw, init_vh);
+        let mut prev_scene = game.current_scene;
+
         // Inner loop: game frames
         while window.is_open() {
             // Track window size changes (for resizable windowed mode)
@@ -227,12 +379,26 @@ pub fn run(assets: AssetStore) -> Result<()> {
                 scaled_buf.resize(out_w * out_h, 0);
             }
 
-            // Mouse → logical 640×480
+            // Compute viewport for current display mode
+            let display_mode = game.dev_menu.display_mode;
+            let (vx, vy, vw, vh) = compute_viewport(out_w, out_h, display_mode);
+
+            // Mouse → logical 640×480 (accounting for viewport offset)
             let (mouse_x, mouse_y) = window
                 .get_mouse_pos(MouseMode::Clamp)
                 .unwrap_or((0.0, 0.0));
-            let mx = ((mouse_x as usize) * SCREEN_WIDTH / out_w.max(1)) as i32;
-            let my = ((mouse_y as usize) * SCREEN_HEIGHT / out_h.max(1)) as i32;
+            let raw_mx = mouse_x as usize;
+            let raw_my = mouse_y as usize;
+            let mx = if raw_mx >= vx && raw_mx < vx + vw {
+                (((raw_mx - vx) * SCREEN_WIDTH) / vw.max(1)) as i32
+            } else {
+                if raw_mx < vx { 0 } else { SCREEN_WIDTH as i32 - 1 }
+            };
+            let my = if raw_my >= vy && raw_my < vy + vh {
+                (((raw_my - vy) * SCREEN_HEIGHT) / vh.max(1)) as i32
+            } else {
+                if raw_my < vy { 0 } else { SCREEN_HEIGHT as i32 - 1 }
+            };
             let mx = mx.clamp(0, SCREEN_WIDTH as i32 - 1);
             let my = my.clamp(0, SCREEN_HEIGHT as i32 - 1);
 
@@ -259,7 +425,9 @@ pub fn run(assets: AssetStore) -> Result<()> {
                             game.on_click(mx, my);
                         }
 
-                        if window.get_mouse_down(MouseButton::Right) {
+                        let right_down = window.get_mouse_down(MouseButton::Right);
+                        let right_clicked = right_down && !prev_right_down;
+                        if right_clicked {
                             game.on_right_click(mx, my);
                         }
 
@@ -303,9 +471,9 @@ pub fn run(assets: AssetStore) -> Result<()> {
                         }
 
                         // Mouse hover over menu items
-                        let box_x = (SCREEN_WIDTH as i32 - 280) / 2;
-                        let box_y = (SCREEN_HEIGHT as i32 - 180) / 2;
-                        if mx >= box_x + 6 && mx < box_x + 274 {
+                        let box_x = (SCREEN_WIDTH as i32 - 300) / 2;
+                        let box_y = (SCREEN_HEIGHT as i32 - 210) / 2;
+                        if mx >= box_x + 6 && mx < box_x + 294 {
                             let rel_y = my - (box_y + 44);
                             if rel_y >= 0 {
                                 let idx = (rel_y / 26) as usize;
@@ -322,7 +490,7 @@ pub fn run(assets: AssetStore) -> Result<()> {
                         if window.is_key_pressed(Key::Enter, minifb::KeyRepeat::No) {
                             action = Some(sel);
                         }
-                        if mouse_clicked && mx >= box_x + 6 && mx < box_x + 274 {
+                        if mouse_clicked && mx >= box_x + 6 && mx < box_x + 294 {
                             let rel_y = my - (box_y + 44);
                             if rel_y >= 0 {
                                 let idx = (rel_y / 26) as usize;
@@ -337,11 +505,16 @@ pub fn run(assets: AssetStore) -> Result<()> {
                                 0 => engine_state = EngineState::Playing,
                                 1 => toggle_fs = true,
                                 2 => {
+                                    // Cycle display mode
+                                    game.dev_menu.display_mode = game.dev_menu.display_mode.next();
+                                    tracing::info!("Display mode → {:?}", game.dev_menu.display_mode);
+                                }
+                                3 => {
                                     // Toggle detail noise
                                     game.dev_menu.detail_noise = !game.dev_menu.detail_noise;
                                     tracing::info!("Detail noise → {}", game.dev_menu.detail_noise);
                                 }
-                                3 => {
+                                4 => {
                                     tracing::info!("Engine shutdown (menu)");
                                     return Ok(());
                                 }
@@ -356,6 +529,7 @@ pub fn run(assets: AssetStore) -> Result<()> {
                 break;
             }
             prev_mouse_down = mouse_down;
+            prev_right_down = window.get_mouse_down(MouseButton::Right);
 
             // Render
             framebuffer.fill(0xFF000000);
@@ -393,15 +567,40 @@ pub fn run(assets: AssetStore) -> Result<()> {
             }
 
             let hover_name = game.get_hover_info(mx, my);
+
+            // Snapshot the scene-only framebuffer before UI overlays
+            let scene_snap: Vec<u32> = framebuffer.clone();
+
             game.draw_ui(&mut framebuffer);
+
+            // Debug: draw UI element hitboxes (after draw_ui so they appear on top)
+            if game.dev_menu.show_hitboxes {
+                let ui_color = 0xFF00FFFF; // cyan to distinguish from sprite hitboxes
+                for (rx, ry, rw, rh, label) in game.scene_handler.get_ui_rects() {
+                    font::draw_rect_outline(&mut framebuffer, rx, ry, rw, rh, ui_color);
+                    let tag = format!("{} ({},{} {}x{})", label, rx, ry, rw, rh);
+                    let tw = font::text_width(&tag);
+                    let lx = rx.max(0);
+                    let ly = (ry - 12).max(0);
+                    font::draw_rect(&mut framebuffer, lx, ly, tw + 2, 11, 0xCC000000);
+                    font::draw_text(&mut framebuffer, lx + 1, ly + 1, &tag, ui_color);
+                }
+            }
 
             // Draw escape menu overlay if paused
             if let EngineState::EscapeMenu { selected } = engine_state {
-                draw_escape_menu(&mut framebuffer, selected, game.dev_menu.detail_noise, game.language);
+                draw_escape_menu(&mut framebuffer, selected, game.dev_menu.detail_noise,
+                                 game.dev_menu.display_mode, game.language);
             }
 
             // Software cursor (drawn last, always on top)
             game.cursor.blit(&mut framebuffer, SCREEN_WIDTH, SCREEN_HEIGHT, mx, my);
+
+            // Build UI mask: true where UI changed a pixel vs the scene snapshot
+            let ui_mask: Vec<bool> = framebuffer.iter()
+                .zip(scene_snap.iter())
+                .map(|(cur, snap)| cur != snap)
+                .collect();
 
             // Update window title
             frame_count += 1;
@@ -420,9 +619,16 @@ pub fn run(assets: AssetStore) -> Result<()> {
                 window.set_title(&title);
             }
 
+            // Regenerate noise map when viewport or scene changes
+            if !noise_map.matches(vw, vh) || game.current_scene != prev_scene {
+                noise_map = NoiseMap::generate(vw, vh);
+                prev_scene = game.current_scene;
+            }
+
             // Scale to output size and present
-            scale_to_size(&framebuffer, &mut scaled_buf, out_w, out_h,
-                          game.dev_menu.detail_noise, frame_count);
+            let nm = if game.dev_menu.detail_noise { Some(&noise_map) } else { None };
+            scale_to_viewport(&framebuffer, &mut scaled_buf, out_w, out_h,
+                              vx, vy, vw, vh, nm, &ui_mask);
             window
                 .update_with_buffer(&scaled_buf, out_w, out_h)
                 .map_err(|e| anyhow::anyhow!("Display error: {}", e))?;
@@ -432,7 +638,7 @@ pub fn run(assets: AssetStore) -> Result<()> {
             fullscreen = !fullscreen;
             tracing::info!(
                 "Fullscreen → {}",
-                if fullscreen { "ON (1920×1080)" } else { "OFF (1280×960)" }
+                if fullscreen { "ON (borderless)" } else { "OFF (1280×960)" }
             );
             engine_state = EngineState::Playing;
             continue;

@@ -42,16 +42,19 @@ impl PartData {
     }
 
     /// Is this a morph-child (placed variant of a parent)?
+    #[allow(dead_code)] // used by junkyard_parts() for future junk distribution
     pub fn is_morph_child(&self) -> bool {
         self.master != 0
     }
 
     /// Can this part be picked up from the junkyard? (has a junk_view)
+    #[allow(dead_code)] // used by junkyard_parts() for future junk distribution
     pub fn has_junk_view(&self) -> bool {
         !self.junk_view.is_empty()
     }
 
     /// Can this part be placed on a car? (has a use_view)
+    #[allow(dead_code)] // future: validate car build
     pub fn has_use_view(&self) -> bool {
         !self.use_view.is_empty()
     }
@@ -81,6 +84,7 @@ pub struct PartProperties {
     pub pedals: i32,
     pub load_capacity: i32,
     pub engine_type: i32,
+    #[allow(dead_code)] // TODO: used for car color rendering
     pub color: i32,
 }
 
@@ -106,6 +110,7 @@ pub struct PartsDB {
 
 /// Part category for junk distribution
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // TODO: wire into dynamic junk pile generation
 pub enum PartCategory {
     JunkMan,
     Destination,
@@ -176,6 +181,7 @@ impl PartsDB {
     }
 
     /// Get all standalone parts (not morph children) that can be picked up
+    #[allow(dead_code)] // TODO: wire into dynamic junk pile generation
     pub fn junkyard_parts(&self) -> Vec<&PartData> {
         self.parts
             .values()
@@ -227,6 +233,7 @@ impl PartsDB {
     }
 
     /// Part IDs assigned to JunkMan category (from mulle.js savedata.js)
+    #[allow(dead_code)] // TODO: wire into dynamic junk pile generation
     pub fn junkman_part_ids() -> &'static [u32] {
         &[
             13, 14, 17, 18, 19, 20, 21, 22, 24, 25, 26, 27, 28, 32, 35,
@@ -238,6 +245,7 @@ impl PartsDB {
     }
 
     /// Part IDs found at destinations (from mulle.js savedata.js)
+    #[allow(dead_code)] // TODO: wire into dynamic junk pile generation
     pub fn destination_part_ids() -> &'static [u32] {
         &[9, 54, 99, 113, 162, 172, 283, 287, 306]
     }
@@ -254,6 +262,7 @@ impl PartsDB {
     }
 
     /// Determine what category a part belongs to
+    #[allow(dead_code)] // TODO: wire into dynamic junk pile generation
     pub fn part_category(&self, part_id: u32) -> Option<PartCategory> {
         if Self::junkman_part_ids().contains(&part_id) {
             Some(PartCategory::JunkMan)

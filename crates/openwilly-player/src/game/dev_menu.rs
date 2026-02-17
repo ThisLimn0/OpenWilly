@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 use crate::engine::font;
-use crate::engine::{SCREEN_WIDTH, SCREEN_HEIGHT};
+use crate::engine::{SCREEN_WIDTH, SCREEN_HEIGHT, DisplayMode};
 use crate::game::Scene;
 
 // ─── Menu definition ────────────────────────────────────────────────────
@@ -74,6 +74,7 @@ pub struct DevMenu {
 
     // ── Video ──
     pub detail_noise: bool,
+    pub display_mode: DisplayMode,
 
     // ── Activation detector ──
     hash_times: Vec<Instant>,
@@ -92,6 +93,7 @@ impl DevMenu {
             skip_dialogs: false,
             meme_mode: false,
             detail_noise: false,
+            display_mode: DisplayMode::Pillarbox,
             hash_times: Vec::new(),
         }
     }

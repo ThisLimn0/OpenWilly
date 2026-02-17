@@ -73,6 +73,8 @@ pub struct BuildCar {
     pub points: HashMap<String, LivePoint>,
     /// Which attachment points are used by parts
     pub used_points: HashMap<String, u32>,
+    /// Which attachment points are covered (blocked) by placed parts
+    pub covered_points: HashMap<String, u32>,
     /// Whether the car is locked (no modifications allowed)
     pub locked: bool,
     /// Cached rendered sprites (rebuilt on refresh)
@@ -90,6 +92,7 @@ impl BuildCar {
             parts: Vec::new(),
             points: HashMap::new(),
             used_points: HashMap::new(),
+            covered_points: HashMap::new(),
             locked: false,
             part_sprites: Vec::new(),
             properties: CarProperties::default(),
@@ -176,9 +179,10 @@ impl BuildCar {
         })
     }
 
-    /// Check if a part can be attached (required points exist and are free)
+    /// Check if a part can be attached (required points exist, are free, and not covered)
     pub fn can_attach_part(&self, part: &PartData) -> bool {
         for req in &part.requires {
+            // Point must exist on the car
             match self.points.get(req) {
                 Some(point) => {
                     if point.occupied_by.is_some() {
@@ -186,6 +190,16 @@ impl BuildCar {
                     }
                 }
                 None => return false, // Point doesn't exist on car
+            }
+            // Point must not be covered by another part
+            if self.covered_points.contains_key(req) {
+                return false;
+            }
+        }
+        // Check that none of the part's covers points are already covered
+        for cover in &part.covers {
+            if self.covered_points.contains_key(cover) {
+                return false;
             }
         }
         true
@@ -223,6 +237,7 @@ impl BuildCar {
     fn rebuild_points(&mut self, parts_db: &PartsDB) {
         self.points.clear();
         self.used_points.clear();
+        self.covered_points.clear();
 
         // First pass: collect all attachment points provided by parts
         for &pid in &self.parts {
@@ -247,6 +262,15 @@ impl BuildCar {
                         point.occupied_by = Some(pid);
                     }
                     self.used_points.insert(req.clone(), pid);
+                }
+            }
+        }
+
+        // Third pass: mark covered points (from Covers)
+        for &pid in &self.parts {
+            if let Some(part) = parts_db.get(pid) {
+                for cover in &part.covers {
+                    self.covered_points.insert(cover.clone(), pid);
                 }
             }
         }
@@ -381,10 +405,11 @@ impl BuildCar {
     }
 
     /// Get free attachment points (for snap targets)
+    /// Excludes occupied and covered points.
     pub fn free_attachment_points(&self) -> Vec<(&str, i32, i32)> {
         self.points
             .values()
-            .filter(|p| p.occupied_by.is_none())
+            .filter(|p| p.occupied_by.is_none() && !self.covered_points.contains_key(&p.id))
             .map(|p| (p.id.as_str(), self.x + p.offset.0, self.y + p.offset.1))
             .collect()
     }

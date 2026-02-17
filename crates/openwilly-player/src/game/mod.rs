@@ -238,7 +238,7 @@ impl GameState {
         }
 
         // Tick scene actors, collect animation events
-        let scene_events = self.scene_handler.update(&self.assets);
+        let scene_events = self.scene_handler.update(&self.assets, self.mouse_x, self.mouse_y);
         for event in &scene_events {
             self.handle_scene_event(event);
         }
@@ -600,13 +600,22 @@ impl GameState {
             }
         }
 
+        // Capture current pile items BEFORE click processing (pile switch clears them)
+        let pre_click_pile_items = if self.current_scene == Scene::Junkyard {
+            Some((self.current_pile_index(), self.scene_handler.drag_drop.item_positions()))
+        } else {
+            None
+        };
+
         if let Some(next) = self.scene_handler.on_click(x, y, &self.assets) {
             // Gate check: Garage → Yard requires road-legal car
             if next == Scene::Yard && self.current_scene == Scene::Garage {
                 if !self.car.is_road_legal() {
                     let failures = self.car.properties().road_legal_failures();
                     let hints = dialog::road_legal_hint_sounds(&failures);
-                    for hint_id in &hints {
+                    // Play only the first hint — the original game stops at
+                    // the first missing property and speaks only that one.
+                    if let Some(hint_id) = hints.first() {
                         self.play_dialog(hint_id);
                     }
                     tracing::info!("Garage→Yard blocked: car not road legal ({:?})", failures);
@@ -614,6 +623,25 @@ impl GameState {
                 }
             }
             self.switch_scene(next);
+        }
+
+        // Handle junkyard pile switch: save old pile, load new pile parts
+        if let Some((old_pile, new_pile)) = self.scene_handler.pile_switched.take() {
+            // Save parts from the old pile (captured before items were cleared)
+            if let Some((captured_pile, positions)) = pre_click_pile_items {
+                if captured_pile == old_pile {
+                    self.save_manager.save_pile(old_pile, &positions);
+                }
+            }
+            self.save_manager.save_last_pile(new_pile);
+            self.save_manager.save();
+
+            // Load parts for the new pile from save data
+            let pile_parts = self.save_manager.active()
+                .map(|u| u.junk.pile(new_pile).clone())
+                .unwrap_or_default();
+            tracing::debug!("Junkyard pile {}: {} parts", new_pile, pile_parts.len());
+            self.spawn_parts_from_map(&pile_parts, true);
         }
     }
 
@@ -640,15 +668,29 @@ impl GameState {
                     if let Some(snd) = &mut self.sound {
                         snd.play_by_name("00e003v0", &self.assets); // detach/pop sound
                     }
-                    // TODO: create a draggable item at the detach world position
+                    // Create a draggable item at the detach world position
+                    // Use master_id so morph children revert to their parent form
+                    if let build_car::CarEvent::Detached { master_id, world_x, world_y, .. } = &event {
+                        let spawn_id = *master_id;
+                        let z = self.scene_handler.drag_drop.items.iter()
+                            .map(|i| i.z_order).max().unwrap_or(100) + 1;
+                        let sprite = self.make_part_sprite(spawn_id, *world_x, *world_y, z);
+                        let mut item = drag_drop::DraggableItem::new(spawn_id, *world_x, *world_y, sprite, z);
+                        item.physics_enabled = false;
+                        self.populate_morph_sprites(&mut item);
+                        self.scene_handler.drag_drop.add_item(item);
+                    }
+                    // Rebuild snap targets after detach
+                    self.rebuild_snap_targets();
                 }
             }
         }
-        self.scene_handler.on_right_click(x, y);
+        // Debug sprite toggle removed — was causing screen flash by hiding scene background
     }
 
     /// Update mouse state each frame (call before on_click)
     pub fn on_mouse_state(&mut self, x: i32, y: i32, down: bool) {
+        let just_pressed = down && !self.mouse_down;
         self.mouse_x = x;
         self.mouse_y = y;
         self.mouse_down = down;
@@ -667,6 +709,50 @@ impl GameState {
                 if just_hovered {
                     if let Some(snd) = &mut self.sound {
                         snd.play_by_name(toolbox::TOOLBOX_HOVER_SOUND, &self.assets);
+                    }
+                }
+            }
+        }
+
+        // Garage: left-click on an attached car part → detach it and start dragging
+        if just_pressed && self.current_scene == Scene::Garage {
+            // Only if we're not already clicking on a loose drag-drop item
+            if self.scene_handler.drag_drop.item_at(x, y).is_none() {
+                if let Some(part_id) = self.car.part_at(x, y) {
+                    let default_parts = PartsDB::default_car_parts();
+                    if !default_parts.contains(&part_id) {
+                        if let Some(event) = self.car.detach(part_id, &self.parts_db, &self.assets) {
+                            let (wx, wy) = match &event {
+                                build_car::CarEvent::Detached { world_x, world_y, .. } => (*world_x, *world_y),
+                                _ => (x, y),
+                            };
+                            tracing::info!("Left-click detach part {} at ({}, {})", part_id, wx, wy);
+                            self.save_manager.save_car_parts(&self.car.parts);
+                            if let Some(snd) = &mut self.sound {
+                                snd.play_by_name("00e003v0", &self.assets);
+                            }
+                            // Create a draggable item at the detach position and start dragging it
+                            // Use master_id so morph children revert to parent form
+                            let spawn_id = match &event {
+                                build_car::CarEvent::Detached { master_id, .. } => *master_id,
+                                _ => part_id,
+                            };
+                            let z = self.scene_handler.drag_drop.items.iter()
+                                .map(|i| i.z_order).max().unwrap_or(100) + 1;
+                            let sprite = self.make_part_sprite(spawn_id as u32, wx, wy, z);
+                            let mut item = drag_drop::DraggableItem::new(spawn_id as u32, wx, wy, sprite, z);
+                            item.physics_enabled = false;
+                            item.dragging = true;
+                            self.populate_morph_sprites(&mut item);
+                            let idx = self.scene_handler.drag_drop.add_item(item);
+                            self.scene_handler.drag_drop.dragging_idx = Some(idx);
+                            self.scene_handler.drag_drop.grab_offset_x = wx - x;
+                            self.scene_handler.drag_drop.grab_offset_y = wy - y;
+                            // Mark prev_mouse_down so process_drag doesn't re-trigger on_mouse_down
+                            self.scene_handler.drag_drop.prev_mouse_down = true;
+                            // Rebuild snap targets after detach
+                            self.rebuild_snap_targets();
+                        }
                     }
                 }
             }
@@ -835,6 +921,8 @@ impl GameState {
                             };
                             snd.play_by_name(sound_id, &self.assets);
                         }
+                        // Rebuild snap targets so remaining parts see updated availability
+                        self.rebuild_snap_targets();
                     }
                 }
             }
@@ -848,10 +936,13 @@ impl GameState {
                 });
                 match target_id.as_str() {
                     "door_junk" => {
-                        // Garage → Junkyard pile 1
+                        // Garage → Junkyard (last visited pile, not always pile 1)
+                        let target_pile = self.save_manager.active()
+                            .map(|u| u.my_last_pile)
+                            .unwrap_or(1);
                         let rx = (pid * 37 % 500 + 70) as i32;
                         self.save_manager.active_mut().map(|u| {
-                            u.junk.pile1.insert(pid, (rx, 240));
+                            u.junk.pile_mut(target_pile).insert(pid, (rx, 240));
                         });
                     }
                     "door_yard" => {
@@ -1401,15 +1492,20 @@ impl GameState {
             tracing::debug!("Dialog '{}' skipped (dev cheat)", audio_id);
             return;
         }
+        // Check if a dialog is already playing — if so, this one gets queued
+        let already_talking = self.dialog.is_talking();
         // Get audio duration so subtitles are timed to match the actual speech
         let duration_ms = self.assets.sound_duration_ms(audio_id);
         self.dialog.talk_timed(audio_id, duration_ms);
-        if let Some(snd) = &mut self.sound {
-            if let Some(handle) = snd.play_by_name(audio_id, &self.assets) {
-                // Set up cue-point tracking if the sound has cue points
-                let cue_points = self.assets.find_cue_points(audio_id);
-                if !cue_points.is_empty() {
-                    self.dialog.set_cue_tracking(audio_id, handle, cue_points);
+        // Only play audio for the FIRST dialog (not queued ones — they overlap)
+        if !already_talking {
+            if let Some(snd) = &mut self.sound {
+                if let Some(handle) = snd.play_by_name(audio_id, &self.assets) {
+                    // Set up cue-point tracking if the sound has cue points
+                    let cue_points = self.assets.find_cue_points(audio_id);
+                    if !cue_points.is_empty() {
+                        self.dialog.set_cue_tracking(audio_id, handle, cue_points);
+                    }
                 }
             }
         }
@@ -1445,6 +1541,19 @@ impl GameState {
                 self.scene_handler.stop_talking_actor();
                 // Dialog chaining / quest progression
                 self.on_dialog_finished(audio_id);
+
+                // Play audio for the next queued dialog (if any)
+                if let Some(next_dialog) = &self.dialog.active_dialog {
+                    let next_id = next_dialog.audio_id.clone();
+                    if let Some(snd) = &mut self.sound {
+                        if let Some(handle) = snd.play_by_name(&next_id, &self.assets) {
+                            let cue_points = self.assets.find_cue_points(&next_id);
+                            if !cue_points.is_empty() {
+                                self.dialog.set_cue_tracking(&next_id, handle, cue_points);
+                            }
+                        }
+                    }
+                }
             }
             DialogEvent::QueueEmpty => {
                 tracing::debug!("Dialog queue empty (scene: {:?})", self.current_scene);
@@ -1588,7 +1697,9 @@ impl GameState {
                     }
                 };
                 if let Some((fname, num)) = resolved {
-                    if let Some(bmp) = self.assets.decode_bitmap_transparent(&fname, num) {
+                    // Use decode_bitmap (opaque) — white pixels in cutscene
+                    // images must not be treated as transparent.
+                    if let Some(bmp) = self.assets.decode_bitmap(&fname, num) {
                         let cx = (640 - bmp.width as i32) / 2;
                         let cy = (480 - bmp.height as i32) / 2;
                         self.transition = Some(TransitionCutscene {
@@ -1752,8 +1863,10 @@ impl GameState {
 
         // --- Login on menu → garage transition ---
         if prev_scene == Scene::Menu && scene == Scene::Garage {
-            // Auto-login default profile
-            self.login_user("default");
+            // Login with the name entered in the menu
+            let name = self.scene_handler.effective_name();
+            let login_name = if name.is_empty() { "default".to_string() } else { name };
+            self.login_user(&login_name);
         }
 
         // --- Destination interactions (legacy — now handled by SceneScript) ---
@@ -1790,6 +1903,10 @@ impl GameState {
                     tracing::info!("Destination {} script activated", n);
                 }
             } else if scene == Scene::Menu {
+                // Load saved profile names into menu UI
+                let names: Vec<String> = self.save_manager.profile_names()
+                    .iter().map(|s| s.to_string()).collect();
+                self.scene_handler.saved_names = names;
                 // Menu intro script: jingle → ambient → Mulle greeting
                 let jingle_ms = self.assets.sound_duration_ms("10e001v0");
                 self.active_script = Some(scene_script::build_menu_script(jingle_ms));
@@ -1812,22 +1929,7 @@ impl GameState {
             }
 
             // Populate snap targets from car attachment points
-            let free_points = self.car.free_attachment_points();
-            for (id, wx, wy) in &free_points {
-                // Check which parts could attach here and mark coverage
-                let compatible = self.parts_db.parts_for_attachment(id);
-                tracing::trace!("Snap target {}: {} compatible parts", id, compatible.len());
-
-                self.scene_handler.drag_drop.snap_targets.push(
-                    drag_drop::SnapTarget {
-                        point_id: id.to_string(),
-                        x: *wx,
-                        y: *wy,
-                        occupied: false,
-                        covered_by: None,
-                    }
-                );
-            }
+            self.rebuild_snap_targets();
             // Log total part IDs for debugging
             tracing::debug!("PartsDB: {} total IDs available", self.parts_db.all_ids().len());
 
@@ -1886,6 +1988,22 @@ impl GameState {
         }
 
         if scene == Scene::Junkyard {
+            // Restore last-visited pile from save data
+            let saved_pile = self.save_manager.active()
+                .map(|u| u.my_last_pile)
+                .unwrap_or(1)
+                .clamp(1, 6);
+            if saved_pile != self.scene_handler.junk_pile {
+                // Re-load the correct pile (scene_handler defaults to pile 1)
+                self.scene_handler.junk_pile = saved_pile;
+                self.scene_handler.sprites.clear();
+                self.scene_handler.buttons.clear();
+                self.scene_handler.actors.clear();
+                self.scene_handler.drag_drop.items.clear();
+                self.scene_handler.drag_drop.drop_targets.clear();
+                self.scene_handler.hotspots.clear();
+                self.scene_handler.load_junkyard_pile(saved_pile, &self.assets);
+            }
             // Spawn parts from the current pile (from save data)
             let pile_idx = self.current_pile_index();
             let pile_parts = self.save_manager.active()
@@ -1898,11 +2016,9 @@ impl GameState {
         self.play_scene_sounds();
     }
 
-    /// Get the current junkyard pile index (1-6), defaults based on save data
+    /// Get the current junkyard pile index (1-6) from the scene handler
     fn current_pile_index(&self) -> u8 {
-        self.save_manager.active()
-            .map(|u| u.my_last_pile)
-            .unwrap_or(1)
+        self.scene_handler.junk_pile
     }
 
     /// Create a Sprite for a part by resolving its `junk_view` member name
@@ -1957,6 +2073,57 @@ impl GameState {
         }
     }
 
+    /// Populate morph variant sprites for a draggable item.
+    /// For morph parents, loads all variant UseView sprites with correct snap offsets.
+    fn populate_morph_sprites(&self, item: &mut drag_drop::DraggableItem) {
+        let part = match self.parts_db.get(item.part_id) {
+            Some(p) => p,
+            None => return,
+        };
+        if !part.is_morph_parent() {
+            return;
+        }
+        let morphs = self.parts_db.get_morphs(item.part_id);
+        for morph in &morphs {
+            // Skip variants that can't currently attach to the car
+            if !self.car.can_attach_part(morph) {
+                continue;
+            }
+            if morph.use_view.is_empty() {
+                continue;
+            }
+            // Load the UseView sprite for this morph variant
+            let bmp = match self.assets.find_bitmap_by_name(&morph.use_view) {
+                Some(b) => b,
+                None => continue,
+            };
+            let (reg_x, reg_y) = self.assets.find_bitmap_info_by_name(&morph.use_view)
+                .map(|(_, _, bi)| (bi.reg_x as i32, bi.reg_y as i32))
+                .unwrap_or((0, 0));
+            // Snap position: car origin + morph variant offset (matching mulle.js)
+            let snap_x = self.car.x + morph.offset.0;
+            let snap_y = self.car.y + morph.offset.1;
+            let sprite = Sprite {
+                x: snap_x - reg_x,
+                y: snap_y - reg_y,
+                width: bmp.width,
+                height: bmp.height,
+                pixels: bmp.pixels,
+                visible: true,
+                z_order: 50,
+                name: format!("morph:{}#{}", morph.use_view, morph.part_id),
+                interactive: false,
+                member_num: morph.part_id,
+            };
+            item.morph_sprites.push(drag_drop::MorphVariant {
+                morph_part_id: morph.part_id,
+                use_view_sprite: sprite,
+                offset_x: snap_x,
+                offset_y: snap_y,
+            });
+        }
+    }
+
     /// Spawn a set of parts (from save data HashMap) as DraggableItems
     /// into the scene's drag_drop system. Used for junkyard piles,
     /// shop floor, and yard.
@@ -1966,8 +2133,83 @@ impl GameState {
             let sprite = self.make_part_sprite(pid, x, y, z);
             let mut item = drag_drop::DraggableItem::new(pid, x, y, sprite, z);
             item.physics_enabled = physics;
+            self.populate_morph_sprites(&mut item);
             self.scene_handler.drag_drop.add_item(item);
         }
+    }
+
+    /// Rebuild snap targets from the car's current free attachment points.
+    /// Also re-populates morph sprites on all existing draggable items so
+    /// they reflect the latest car state (available attachment points).
+    fn rebuild_snap_targets(&mut self) {
+        self.scene_handler.drag_drop.snap_targets.clear();
+        let free_points = self.car.free_attachment_points();
+        for (id, wx, wy) in &free_points {
+            let compatible = self.parts_db.parts_for_attachment(id);
+            tracing::trace!("Snap target {}: {} compatible parts", id, compatible.len());
+            self.scene_handler.drag_drop.snap_targets.push(
+                drag_drop::SnapTarget {
+                    point_id: id.to_string(),
+                    x: *wx,
+                    y: *wy,
+                    occupied: false,
+                    covered_by: None,
+                }
+            );
+        }
+        // Refresh morph sprites on all draggable items (attachment availability changed)
+        let item_count = self.scene_handler.drag_drop.items.len();
+        for i in 0..item_count {
+            self.scene_handler.drag_drop.items[i].morph_sprites.clear();
+            // We need to borrow fields separately to satisfy the borrow checker
+            let part_id = self.scene_handler.drag_drop.items[i].part_id;
+            let part = match self.parts_db.get(part_id) {
+                Some(p) => p,
+                None => continue,
+            };
+            if !part.is_morph_parent() {
+                continue;
+            }
+            let morphs = self.parts_db.get_morphs(part_id);
+            for morph in &morphs {
+                if !self.car.can_attach_part(morph) {
+                    continue;
+                }
+                if morph.use_view.is_empty() {
+                    continue;
+                }
+                let bmp = match self.assets.find_bitmap_by_name(&morph.use_view) {
+                    Some(b) => b,
+                    None => continue,
+                };
+                let (reg_x, reg_y) = self.assets.find_bitmap_info_by_name(&morph.use_view)
+                    .map(|(_, _, bi)| (bi.reg_x as i32, bi.reg_y as i32))
+                    .unwrap_or((0, 0));
+                let snap_x = self.car.x + morph.offset.0;
+                let snap_y = self.car.y + morph.offset.1;
+                let sprite = Sprite {
+                    x: snap_x - reg_x,
+                    y: snap_y - reg_y,
+                    width: bmp.width,
+                    height: bmp.height,
+                    pixels: bmp.pixels,
+                    visible: true,
+                    z_order: 50,
+                    name: format!("morph:{}#{}", morph.use_view, morph.part_id),
+                    interactive: false,
+                    member_num: morph.part_id,
+                };
+                self.scene_handler.drag_drop.items[i].morph_sprites.push(
+                    drag_drop::MorphVariant {
+                        morph_part_id: morph.part_id,
+                        use_view_sprite: sprite,
+                        offset_x: snap_x,
+                        offset_y: snap_y,
+                    }
+                );
+            }
+        }
+        tracing::debug!("Rebuilt snap targets: {} points", self.scene_handler.drag_drop.snap_targets.len());
     }
 
     /// Load a topology bitmap by member name (e.g. "30t001v0") into `topo_data`.
