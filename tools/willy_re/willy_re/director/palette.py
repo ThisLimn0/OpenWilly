@@ -2077,7 +2077,6 @@ def _raw_to_tuples(raw: list[int]) -> list[tuple[int, int, int]]:
     """Convert flat [R,G,B,0, R,G,B,0, ...] to [(R,G,B), ...]."""
     result = []
     for i in range(0, len(raw), 4):
-        # Raw data is already in RGB order (verified against known palette entries)
         result.append((raw[i], raw[i + 1], raw[i + 2]))
     return result
 

@@ -10,9 +10,9 @@ import logging
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, Any, BinaryIO
+from typing import Any, BinaryIO
 
-from .chunks import CAST_TYPE_NAMES, VERSION_TABLE, CastType, ChunkType
+from .chunks import CAST_TYPE_NAMES, VERSION_TABLE, CastType
 
 log = logging.getLogger(__name__)
 
@@ -484,7 +484,7 @@ class DirectorFile:
         _unk1 = struct.unpack(">I", r.read_bytes(4))[0]
         cast_count = struct.unpack(">I", r.read_bytes(4))[0]
         _unk2 = struct.unpack(">I", r.read_bytes(4))[0]
-        array_size = struct.unpack(">I", r.read_bytes(4))[0]
+        _array_size = struct.unpack(">I", r.read_bytes(4))[0]
 
         # Skip offset array
         for _ in range(cast_count):
@@ -826,11 +826,13 @@ class DirectorFile:
     def _parse_sndh(self, member: CastMember, entry: FileEntry) -> None:
         r = self._reader
         r.seek(entry.data_offset + 8)
-        r.skip(4)
+        r.skip(4)  # unknown
         member.sound_length = struct.unpack(">I", r.read_bytes(4))[0]
-        r.skip(4)
-        member.sound_channels = struct.unpack(">H", r.read_bytes(2))[0]
-        r.skip(18 + 4 + 4 + 4)
+        # Skip to sample-rate at sndH offset 44:
+        #   offset  8-11  unknown
+        #   offset 12-31  zeros
+        #   offset 32-43  length repeats / internal counters
+        r.skip(4 + 20 + 4 + 4 + 4)  # 36 bytes → now at offset 44
         member.sound_sample_rate = struct.unpack(">I", r.read_bytes(4))[0]
 
     def _parse_snd(self, member: CastMember, entry: FileEntry) -> None:

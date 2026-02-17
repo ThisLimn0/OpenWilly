@@ -30,6 +30,14 @@ def extract_snds_wav(
     f.seek(offset + 8)  # skip FourCC + length
     raw_data = f.read(length)
 
+    # Sanitise parameters — default to 1-channel, 8-bit, 22050 Hz
+    if channels < 1:
+        channels = 1
+    if sample_width < 1:
+        sample_width = 1
+    if sample_rate < 1:
+        sample_rate = 22050
+
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wav:
         wav.setnchannels(channels)
@@ -150,6 +158,10 @@ def extract_snd_wav(
     # Byte-swap 16-bit samples from big-endian to little-endian
     if sample_width == 2:
         raw_data = _swap_16bit(raw_data)
+
+    # Sanitise channels
+    if channels < 1:
+        channels = 1
 
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wav:
